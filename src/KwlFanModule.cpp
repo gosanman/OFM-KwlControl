@@ -1,0 +1,1061 @@
+#include "KwlFanModule.h"
+
+#include "ChannelPlan.h"
+#include "Drive/Gp8413Drive.h"
+#include "KwlRoomModule.h"
+
+Kwl::KwlFanModule openknxKwlFanModule;
+
+namespace Kwl
+{
+    namespace
+    {
+        /// Parameter eines Verbunds. Die ETS-Makros sind je Verbund eigene Namen
+        /// und lassen sich nicht indizieren - deshalb diese Tabelle statt einer
+        /// Schleife ueber %n%. Sie ist stumpf, aber sie ist an einer Stelle.
+        struct GroupParams
+        {
+            uint8_t role;
+            uint16_t heartbeat;
+            uint16_t masterTimeout;
+            uint8_t followSupply;
+            uint8_t stageRule;
+            uint8_t cycleConflict;
+            bool active;
+            uint8_t leadRoom;
+            uint8_t deadTime;
+            uint8_t ramp;
+            uint16_t cycle[kStageMax + 1]; // Index 1…4
+            uint16_t summer;
+        };
+
+        /// KO-Index innerhalb des Kanalblocks, ohne _channelIndex - das Makro
+        /// FAN_KoCalcIndex rechnet darueber und gibt es nur im Kanal.
+        int koIndex(uint16_t asap)
+        {
+            if (asap < FAN_KoBlockOffset)
+                return -1;
+            const uint16_t rel = asap - FAN_KoBlockOffset;
+            if (rel >= FAN_ChannelCount * FAN_KoBlockSize)
+                return -1;
+            return rel % FAN_KoBlockSize;
+        }
+
+        GroupParams readGroup(uint8_t group)
+        {
+            GroupParams p{};
+            switch (group)
+            {
+#define KWL_READ_GROUP(n)                                                              \
+    case n:                                                                            \
+        p.role = ParamFAN_Grp##n##Role;                                                \
+        p.heartbeat = ParamFAN_Grp##n##Heartbeat;                                      \
+        p.masterTimeout = ParamFAN_Grp##n##MasterTimeout;                              \
+        p.followSupply = ParamFAN_Grp##n##FollowSupply;                                \
+        p.stageRule = ParamFAN_Grp##n##StageRule;                                      \
+        p.cycleConflict = ParamFAN_Grp##n##CycleRule;                                  \
+        p.active = ParamFAN_Grp##n##Active;                                            \
+        p.leadRoom = ParamFAN_Grp##n##LeadRoom;                                        \
+        p.deadTime = ParamFAN_Grp##n##DeadTime;                                                p.ramp = ParamFAN_Grp##n##Ramp;                                                \
+        p.cycle[1] = ParamFAN_Grp##n##CycleS1;                                         \
+        p.cycle[2] = ParamFAN_Grp##n##CycleS2;                                         \
+        p.cycle[3] = ParamFAN_Grp##n##CycleS3;                                         \
+        p.cycle[4] = ParamFAN_Grp##n##CycleS4;                                         \
+        p.summer = ParamFAN_Grp##n##CycleSummer;                                       \
+        break;
+
+                KWL_READ_GROUP(1)
+                KWL_READ_GROUP(2)
+                KWL_READ_GROUP(3)
+                KWL_READ_GROUP(4)
+                KWL_READ_GROUP(5)
+                KWL_READ_GROUP(6)
+                KWL_READ_GROUP(7)
+                KWL_READ_GROUP(8)
+#undef KWL_READ_GROUP
+                default:
+                    break;
+            }
+            return p;
+        }
+    } // namespace
+
+    bool KwlFanModule::checkHardware()
+    {
+        // Die ETS bietet mehr Platinen an, als in diesem Geraet steckt. Stimmen
+        // Auswahl und Bestueckung nicht ueberein, waeren alle Kanalzuordnungen
+        // verschoben - und eine verschobene Zuordnung stellt den falschen Luefter
+        // auf Vollgas. Deshalb Fehlercode 3 und kein stilles Weiterlaufen.
+        //
+        // Der Enum-Wert von FAN_Hardware ist die Platinenkennung FANDRV_BOARD_ID
+        // (Fan.share.xml, PT-FanHardware: 0 = Entwicklungsaufbau, 1 = Rev 0.1, ...),
+        // nicht die Kanalzahl. Zwei Platinen mit gleicher Kanalzahl, aber anderer
+        // Belegung muessen unterscheidbar bleiben. Die Kanalzahl folgt aus dem
+        // Board-Header, der zu dieser Kennung gehoert.
+        if (ParamFAN_Hardware == boardId())
+            return true;
+
+        logErrorP("Hardwareauswahl %u passt nicht zur Platine (%u, %u Kanaele) - "
+                  "alle Ausgaenge bleiben im sicheren Zustand",
+                  (unsigned)ParamFAN_Hardware, (unsigned)boardId(),
+                  (unsigned)boardChannels());
+        mError = ErrorCode::Configuration;
+        return false;
+    }
+
+    void KwlFanModule::setupChannels()
+    {
+        ChannelUse use[FAN_ChannelCount];
+        ChannelFault planFault[FAN_ChannelCount];
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+        {
+            if (mFan[i] == nullptr)
+                mFan[i] = new KwlFan(i);
+            mFan[i]->setup();
+            mFanConfigFault[i] = mFan[i]->isActive() && mFan[i]->configFault();
+            mFanNoDrive[i] = false;
+            use[i] = {mFan[i]->isActive(), mFan[i]->dacChannel(), mFan[i]->channelsNeeded()};
+        }
+
+        // Kanalbelegung gegen die Platine: Kanal vorhanden, ego auf dem ersten
+        // Kanal eines Chips, kein Kanal mit zwei Lueftern. Die ETS prueft davon
+        // nichts.
+        // Ein doppelt belegter Kanal liesse zwei Luefter abwechselnd schreiben,
+        // mit Gegenphase im Takt ein Richtungswechsel je Durchlauf am
+        // Totzeitwaechter vorbei (Invariante 5); ein Kanal jenseits der Platine
+        // liefe "virtuell" ohne Fehlercode (Invariante 10).
+        checkChannelPlan(use, FAN_ChannelCount, boardChannels(), planFault);
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+        {
+            if (planFault[i] == ChannelFault::None)
+                continue;
+            const char* why = planFault[i] == ChannelFault::OutOfRange ? "liegt nicht auf der Platine"
+                              : planFault[i] == ChannelFault::PairStart ? "ego nicht auf dem ersten Kanal eines Chips"
+                                                                         : "doppelt belegt";
+            logErrorP("Luefter %u: DAC-Kanal %u %s - Fehlercode 3", (unsigned)(i + 1),
+                      (unsigned)(mFan[i]->dacChannel() + 1), why);
+            mFanConfigFault[i] = true;
+            mFanNoDrive[i] = true;
+        }
+
+        // Der Typ entscheidet ueber den sicheren Zustand des DAC-Kanals, muss
+        // also VOR KwlOutput::begin() stehen. Nur fuer Luefter mit eindeutigem,
+        // vorhandenem Kanal: ein doppelt belegter Kanal behaelt die Vorgabe
+        // "bipolar" und damit 5,00 V - egal, was die beiden Luefter dort sind.
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+        {
+            if (!mFan[i]->isActive() || mFanNoDrive[i])
+                continue;
+            mOutput.setChannelType(mFan[i]->dacChannel(), mFan[i]->type());
+            if (mFan[i]->channelsNeeded() == 2)
+                mOutput.setChannelType(mFan[i]->dacChannel() + 1, mFan[i]->type());
+        }
+    }
+
+    bool KwlFanModule::inSlot(uint8_t fan, uint8_t slot) const
+    {
+        const KwlFan* f = mFan[fan];
+        if (f == nullptr)
+            return false;
+        return slot < kGroupsMax && f->groupNo() == slot + 1;
+    }
+
+    void KwlFanModule::setupGroups()
+    {
+        for (uint8_t g = 0; g < kGroupsMax; g++)
+        {
+            const GroupParams p = readGroup(g + 1);
+            mGroupActive[g] = p.active;
+            if (!p.active)
+                continue;
+
+            mGroupRole[g] = static_cast<GroupRole>(p.role);
+            mGroupLeadRoom[g] = p.leadRoom;
+            mGroupFollowSupply[g] = p.followSupply;
+            mGroupHeartbeatMs[g] = static_cast<uint32_t>(p.heartbeat) * 1000u;
+            mGroupTimeoutMs[g] = static_cast<uint32_t>(p.masterTimeout) * 1000u;
+            mGroupSpeaker[g] = -1;
+            mGroupLastAlive[g] = millis();
+            mGroupTimedOut[g] = false;
+
+            // Die Gruppen-KOs haengen am Luefter mit der kleinsten Nummer in
+            // diesem Verbund - deterministisch und ohne eigenen Parameter.
+            for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+                if (mFan[i] != nullptr && mFan[i]->isActive() && inSlot(i, g))
+                {
+                    mGroupSpeaker[g] = static_cast<int8_t>(i);
+                    break;
+                }
+
+            mGroup[g].setStageRule(static_cast<GroupStageRule>(p.stageRule));
+            mGroup[g].setCycleConflict(static_cast<GroupCycleConflict>(p.cycleConflict));
+            mGroup[g].setLeadRoom(p.leadRoom);
+            mGroup[g].setDeadTime(p.deadTime);
+            mGroup[g].setRampTime(p.ramp);
+            mGroup[g].setSummerCycleTime(p.summer);
+            for (uint8_t s = 1; s <= kStageMax; s++)
+                mGroup[g].setCycleTime(s, p.cycle[s]);
+        }
+
+        // Jeder aktive Luefter braucht einen aktiven Verbund; einen Betrieb
+        // "eigenstaendig" ohne Verbund gibt es nicht. Verbund 0 kommt nur aus
+        // alten Projekten. Gemeldet wird es, nicht still uebergangen.
+        // setupChannels() hat mFanConfigFault schon mit Typ, Kalibrierung und
+        // Kanalbelegung vorbelegt; der fehlende Verbund kommt dazu.
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+        {
+            const KwlFan* fan = mFan[i];
+            const uint8_t g = fan != nullptr ? fan->groupNo() : 0;
+            const bool noGroup = fan != nullptr && fan->isActive() &&
+                                 (g == 0 || g > kGroupsMax || !mGroupActive[g - 1]);
+            if (noGroup)
+            {
+                logErrorP("Luefter %u: Verbund %u ist nicht aktiv - Fehlercode 3, 5,00 V",
+                          (unsigned)(i + 1), (unsigned)g);
+                mFanConfigFault[i] = true;
+            }
+        }
+    }
+
+    void KwlFanModule::setup(bool configured)
+    {
+        mOutput.attach(&boardDacDrive(), boardLeftAligned());
+
+        if (!configured)
+        {
+            // Ohne gueltige Parametrierung wird nicht gefahren - aber die Ausgaenge
+            // muessen trotzdem definiert stehen. begin() schreibt Bereich und
+            // 5,00 V; scheitert es (12 V fehlen noch), holt holdSafeUnconfigured()
+            // das nach, sobald die DACs antworten.
+            if (!mOutput.begin())
+                logErrorP("Ohne Parametrierung: DAC nicht erreichbar (12 V fehlen?)");
+            mOutput.safeAll();
+            return;
+        }
+
+        // Kanaele und Verbuende VOR der Hardwarepruefung: schlaegt sie fehl,
+        // muessen die Luefter den Fehlercode trotzdem auf den Bus bringen koennen.
+        setupChannels();
+        setupGroups();
+        setupButton();
+
+        // Beide Gruppen existieren immer; ob die LED der Platine an einer haengt,
+        // entscheidet die ETS. active() ist sonst falsch, und updateLed() tut nichts.
+        mLedAll = openknx.ledFunctions.get(kLedFunctionAll);
+        mLedFaults = openknx.ledFunctions.get(kLedFunctionFaultsOnly);
+        mLedShown = 0xFF;
+
+        if (!checkHardware())
+        {
+            mOutput.begin();
+            mOutput.safeAll();
+            return;
+        }
+
+        // Reihenfolge nach Sicherheitsinvariante 3: Bereichsregister, sicherer
+        // Zustand, erst danach Sollwerte. begin() macht genau das.
+        if (!mOutput.begin())
+        {
+            mError = mOutput.error();
+            logErrorP("DAC nicht erreichbar - Fehlercode %u", (unsigned)mError);
+            return;
+        }
+
+        logInfoP("%u Stellkanaele bereit, Busformat %s", (unsigned)boardChannels(),
+                 boardLeftAligned() ? "linksbuendig" : "rechtsbuendig");
+    }
+
+    // ------------------------------------------------------------ Ablauf
+
+    void KwlFanModule::loop(bool configured)
+    {
+        if (!configured)
+        {
+            // Zwei Faelle, beide ohne gueltige Parameter:
+            //  - nie parametriert (neues Board): setup(false) hat 5,00 V
+            //    geschrieben, holdSafeUnconfigured() haelt sie - auch ueber ein
+            //    12-V-Aus/Ein hinweg und wenn die 12 V erst nach dem Bus kommen;
+            //  - die ETS laedt gerade (knx.configured() faellt waehrend des
+            //    Downloads auf false). Die Ausgaenge stuenden sonst bis zum
+            //    Neustart auf der letzten Stufe, ungefuehrt. Also sofort der
+            //    sichere Zustand; processBeforeRestart() schreibt ihn danach noch
+            //    einmal (Invariante 8).
+            if (mWasConfigured)
+            {
+                mWasConfigured = false;
+                mOutput.safeAll();
+                logInfoP("Parametrierung ungueltig (ETS-Download?) - sicherer Zustand");
+            }
+            holdSafeUnconfigured(millis());
+            return;
+        }
+        mWasConfigured = true;
+
+        // Busausfall (SAVE-Interrupt): savePower() hat 5,00 V geschrieben. Bis
+        // restorePower() bleibt es dabei, auch wenn die Modulschleife weiterlaeuft.
+        if (mPowerSaved)
+            return;
+
+        // Ein Fehler aus setup() oder aus dem Betrieb (Konfiguration, DAC) laesst
+        // die Ausgaenge im sicheren Zustand - aber er wird GEMELDET, nicht
+        // verschwiegen (Invariante 10). Der Fehlercode geht an jeden Luefter.
+        // Einzige Ausnahme vom Stehenbleiben: kommen die 12 V zurueck, nimmt
+        // tryRecoverOutput() die DACs wieder auf.
+        // Ein Fehler der Ausgabeschicht, der nicht in driveGroup() entstand -
+        // safeAll() im SAVE-Interrupt, driveSafe() eines Luefters mit
+        // Konfigurationsfehler - steht zunaechst nur in mOutput und wird hier
+        // uebernommen; sonst meldete dieser Zweig Code 0 statt 4, und
+        // tryRecoverOutput() griffe nie.
+        // Ein Platinen- oder Konfigurationsfehler (Code 3) bleibt stehen; er
+        // heilt nicht durch ein erfolgreiches begin().
+        if (!mOutput.ready() && mError == ErrorCode::None)
+            mError = mOutput.error();
+
+        if ((mError != ErrorCode::None || !mOutput.ready()) && !tryRecoverOutput(millis()))
+        {
+            for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+                if (mFan[i] != nullptr)
+                    mFan[i]->sendFault(false, mError, ErrorCode::None);
+            updateLed();
+            return;
+        }
+
+        const uint32_t now = millis();
+
+        // Geste der Funktionstaste, gesetzt im Interrupt, ausgefuehrt hier.
+        const uint8_t pending = mButtonPending;
+        if (pending != 0)
+        {
+            mButtonPending = 0;
+            handleButton(pending == 1 ? mButtonShort
+                       : pending == 2 ? mButtonLong
+                                      : mButtonDouble, now);
+        }
+
+        // Zaehler und Filterueberwachung laufen unabhaengig vom Verbund.
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+            if (mFan[i] != nullptr)
+                mFan[i]->loop();
+
+        for (uint8_t g = 0; g < kSlotsMax; g++)
+        {
+            if (!mGroupActive[g])
+                continue;
+            driveGroup(g, now);
+        }
+        driveConfigFaults();
+
+        updateLed();
+    }
+
+    // ------------------------------------------------------------ LED
+
+    void KwlFanModule::updateLed()
+    {
+        const bool all = mLedAll != nullptr && mLedAll->active();
+        const bool faultsOnly = mLedFaults != nullptr && mLedFaults->active();
+        if (!all && !faultsOnly)
+            return;
+
+        // Der schlimmste Zustand ueber alle Luefter - dieselbe Regel wie beim
+        // Fehlercode: der kleinste anliegende Code gewinnt.
+        ErrorCode worst = mError;
+        bool running = false;
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+        {
+            const KwlFan* fan = mFan[i];
+            if (fan == nullptr || !fan->isActive())
+                continue;
+            worst = lowestError(worst, fan->lastError());
+            if (fan->stage() > 0)
+                running = true;
+        }
+
+        // 0 aus, 1 an, 2 Meldung (blinkt), 0x80|Code Alarm (Blinkcode).
+        uint8_t want;
+        if (isAlarm(worst))
+            want = 0x80 | static_cast<uint8_t>(worst);
+        else if (worst != ErrorCode::None)
+            want = 2;
+        else
+            want = (all && running) ? 1 : 0;
+
+        if (want == mLedShown)
+            return;
+        mLedShown = want;
+
+        OpenKNX::Led::FunctionGroup* led = all ? mLedAll : mLedFaults;
+        if (want & 0x80)
+        {
+            // Die "rote LED" der Invariante 10: OpenKNX zeigt den Code als
+            // Blinkfolge - so viele Blitze wie der Code, dann Pause.
+            led->errorCode(want & 0x7F);
+            return;
+        }
+        led->errorCode(0);
+        if (want == 2)
+            led->blinking();
+        else if (want == 1)
+            led->on();
+        else
+            led->off();
+    }
+
+    void KwlFanModule::flashLed()
+    {
+        // Quittung fuer eine Geste. Danach den gemerkten Zustand vergessen, damit
+        // updateLed() die Anzeige wieder aufbaut.
+        OpenKNX::Led::FunctionGroup* led =
+            (mLedAll != nullptr && mLedAll->active()) ? mLedAll
+          : (mLedFaults != nullptr && mLedFaults->active()) ? mLedFaults
+          : nullptr;
+        if (led == nullptr)
+            return;
+        led->flash(1);
+        mLedShown = 0xFF;
+    }
+
+    // ------------------------------------------------------------ Funktionstaste
+
+    void KwlFanModule::setupButton()
+    {
+        mButtonShort = static_cast<ButtonAction>(ParamFAN_ButtonShort);
+        mButtonLong = static_cast<ButtonAction>(ParamFAN_ButtonLong);
+        mButtonDouble = static_cast<ButtonAction>(ParamFAN_ButtonDouble);
+
+#ifdef FUNC1_BUTTON_PIN
+        // Die Rueckrufe laufen im Timer-Interrupt: nur merken, nichts tun.
+        openknx.func1Button.onShortClick([this] { mButtonPending = 1; });
+        openknx.func1Button.onLongClick([this] { mButtonPending = 2; });
+        openknx.func1Button.onDoubleClick([this] { mButtonPending = 3; });
+#endif
+    }
+
+    void KwlFanModule::toggleForcedMode(OperatingMode mode, uint32_t now)
+    {
+        // Steht die Betriebsart in irgendeinem Raum schon als Zwang, nimmt die
+        // Geste sie ueberall zurueck - sonst setzt sie sie ueberall. So kommt man
+        // mit einer Taste immer in beide Richtungen.
+        bool anyActive = false;
+        for (uint8_t r = 1; r <= ROOM_ChannelCount; r++)
+        {
+            KwlRoom* room = openknxKwlRoomModule.room(r);
+            if (room != nullptr && room->forcedModeActive(mode))
+                anyActive = true;
+        }
+        for (uint8_t r = 1; r <= ROOM_ChannelCount; r++)
+        {
+            KwlRoom* room = openknxKwlRoomModule.room(r);
+            if (room == nullptr)
+                continue;
+            if (anyActive)
+                room->clearForcedModeFromDevice(now);
+            else
+                room->forceModeFromDevice(mode, now);
+        }
+        logInfoP("Taste: %s %s", mode == OperatingMode::Boost ? "Stosslueften" : "Ruhe",
+                 anyActive ? "aus" : "ein");
+    }
+
+    void KwlFanModule::handleButton(ButtonAction action, uint32_t now)
+    {
+        switch (action)
+        {
+            case ButtonAction::Boost:
+                toggleForcedMode(OperatingMode::Boost, now);
+                break;
+            case ButtonAction::Quiet:
+                toggleForcedMode(OperatingMode::Quiet, now);
+                break;
+            case ButtonAction::FilterAck:
+            {
+                // Nur faellige Filter: ein versehentlicher Druck setzt keinen
+                // Zaehler zurueck, der noch laeuft.
+                uint8_t count = 0;
+                for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+                    if (mFan[i] != nullptr && mFan[i]->isActive() && mFan[i]->filterDue())
+                    {
+                        mFan[i]->acknowledgeFilter();
+                        count++;
+                    }
+                logInfoP("Taste: %u Filter quittiert", (unsigned)count);
+                break;
+            }
+            case ButtonAction::None:
+            default:
+                return; // keine Quittung fuer eine Geste ohne Wirkung
+        }
+        flashLed();
+    }
+
+    void KwlFanModule::collectMembers(uint8_t group)
+    {
+        KwlGroup& grp = mGroup[group];
+        grp.clearMembers();
+
+        // Slave: der Verbund rechnet nicht aus den Raeumen, sondern folgt dem, was
+        // der Master sendet. Das kommt als EIN Mitglied mit Richtungsforderung
+        // herein - damit laeuft dieselbe Zustandsmaschine, samt Totzeit beim
+        // Wechsel der Halbwelle.
+        if (mGroupRole[group] == GroupRole::Slave)
+        {
+            GroupMember m{};
+            m.roomNo = 0;
+            m.stage = mGroupRxStage[group];
+            m.maxStage = kStageMax;
+            m.cycleWish = CycleRule::Wrg;
+            m.directionDemanded = true;
+            m.direction = mGroupRxTact[group] ? Direction::Exhaust : Direction::Supply;
+            m.phase = 0;
+            m.share = 100;
+            grp.addMember(m);
+            return;
+        }
+
+        // Mitglieder in jedem Durchlauf neu einsammeln: Stufe, Deckel und
+        // Richtungsforderung eines Raums aendern sich staendig, und der Verbund
+        // soll auf dem Stand rechnen, der jetzt gilt.
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+        {
+            KwlFan* fan = mFan[i];
+            if (fan == nullptr || !fan->isActive() || !inSlot(i, group) || mFanConfigFault[i])
+                continue;
+
+            KwlRoom* room = openknxKwlRoomModule.room(fan->roomNo());
+            if (room == nullptr || !room->isActive())
+                continue;
+
+            const StageResult& rs = room->stage();
+
+            GroupMember m;
+            m.roomNo = fan->roomNo();
+            m.stage = rs.stage;
+            // Deckel des Raums fuer die Regel "Maximum, begrenzt durch kleinsten
+            // Raumdeckel". rs.stage enthaelt nur den Deckel des EIGENEN Raums;
+            // stuende hier kStageMax, hielte der Nachtdeckel des Schlafzimmers
+            // den Nachbarn nie auf.
+            // Was die Raenge 1-3 dieses Raums verlangen (Sperre, Schutz,
+            // Zu-/Abluftanforderung), wird davon NICHT begrenzt: das setzt
+            // driveGroup() je Luefter nach der Verbundbildung ein.
+            m.maxStage = room->groupCap();
+            m.cycleWish = room->cycleWish();
+            m.directionDemanded = rs.directionForced;
+            m.direction = rs.direction;
+            m.phase = fan->phase();
+            m.share = fan->share();
+            grp.addMember(m);
+        }
+
+        // "Folgt Zuluftanforderung von Raum n": zieht anderswo ein Geraet Abluft
+        // ab, muss hier nachstroemen. Der Wunsch kommt in-process, nicht ueber den
+        // Bus - das KO am Raum gibt es zusaetzlich fuer fremde Geraete.
+        const uint8_t followRoom = mGroupFollowSupply[group];
+        if (followRoom > 0)
+        {
+            KwlRoom* source = openknxKwlRoomModule.room(followRoom);
+            if (source != nullptr && source->isActive() && source->supplyRequested())
+            {
+                GroupMember m{};
+                m.roomNo = followRoom;
+                m.stage = 0; // nur die Richtung, keine Stufe
+                m.maxStage = kStageMax;
+                m.cycleWish = CycleRule::Wrg;
+                m.directionDemanded = true;
+                m.direction = Direction::Supply;
+                m.phase = 0;
+                m.share = 100;
+                grp.addMember(m);
+            }
+        }
+    }
+
+    void KwlFanModule::sendGroup(uint8_t group, const GroupResult& r, uint32_t now)
+    {
+        const int8_t speaker = mGroupSpeaker[group];
+        if (speaker < 0 || mFan[speaker] == nullptr)
+            return;
+
+        const bool tact = r.phase0Direction == Direction::Exhaust;
+        const bool changed = r.stage != mGroupSentStage[group] ||
+                             tact != mGroupSentTact[group];
+        const bool heartbeat = mGroupHeartbeatMs[group] > 0 &&
+                               (now - mGroupLastSent[group]) >= mGroupHeartbeatMs[group];
+        if (!changed && !heartbeat)
+            return;
+
+        mGroupSentStage[group] = r.stage;
+        mGroupSentTact[group] = tact;
+        mGroupLastSent[group] = now;
+
+        mFan[speaker]->sendGroupState(r.stage, tact);
+    }
+
+    void KwlFanModule::driveGroup(uint8_t group, uint32_t now)
+    {
+        KwlGroup& grp = mGroup[group];
+
+        // Master-Ueberwachung: bleibt das Lebenszeichen aus, weiss der Slave nicht
+        // mehr, in welcher Halbwelle der Verbund steht. Weiterlaufen hiesse raten -
+        // also Stillstand und Fehlercode 2.
+        if (mGroupRole[group] == GroupRole::Slave && mGroupTimeoutMs[group] > 0)
+        {
+            const bool timedOut =
+                (now - mGroupLastAlive[group]) >= mGroupTimeoutMs[group];
+            if (timedOut != mGroupTimedOut[group])
+            {
+                mGroupTimedOut[group] = timedOut;
+                if (timedOut)
+                    logErrorP("Verbund %u: Lebenszeichen des Masters bleibt aus",
+                              (unsigned)(group + 1));
+            }
+        }
+
+        collectMembers(group);
+
+        if (grp.memberCount() == 0)
+            return;
+
+        const GroupResult r = grp.update(now);
+
+        if (mGroupRole[group] == GroupRole::Master)
+            sendGroup(group, r, now);
+
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+        {
+            KwlFan* fan = mFan[i];
+            if (fan == nullptr || !fan->isActive() || !inSlot(i, group) || mFanConfigFault[i])
+                continue;
+
+            // Fehlende Freigabe, Suspendierung oder ein fehlender Master schlagen
+            // alles - sie sind der Grund, warum es Rang 1 gibt. Das ist echter
+            // Stillstand: Stufe 0 und Status.
+            if (fan->blocked() || mGroupTimedOut[group])
+            {
+                fan->driveSafe(mOutput);
+                continue;
+            }
+
+            // Sicherheitsinvariante 5: waehrend des Wechsels steht alles auf
+            // 5,00 V, beim ego beide Motoren gleichzeitig. Die Totzeit ist Teil
+            // der Pendelbewegung - Stufe und Status bleiben.
+            if (r.inDeadTime)
+            {
+                fan->driveHold(mOutput);
+                continue;
+            }
+
+            // Raenge 1-3 des eigenen Raums (Sperre, Schutz, Zu-/Abluftanforderung)
+            // gelten je Luefter, auch im Verbund (Invariante 9):
+            // dann die Raumstufe statt der Verbundstufe, ohne Deckel des Nachbarn.
+            // Die Richtung bleibt aus dem Takt - die Richtungsforderung des Raums
+            // ist dort schon eingerechnet. Gilt auch beim Slave: das Fenster in
+            // diesem Raum kennt der Master nicht.
+            uint8_t stage = r.stage;
+            const KwlRoom* room = openknxKwlRoomModule.room(fan->roomNo());
+            if (room != nullptr && room->isActive())
+                stage = fanStageInGroup(stage, room->stage().source, room->stage().stage);
+
+            // Der Anteil gilt immer, auch fuer die uebersteuerte Stufe: ein Luefter
+            // mit 50 % faehrt bei "Sperre: Grundstufe" in Stosslueften Stufe 2,
+            // nicht 4. Auch bei Sperre und Schutz geht der Anteil nicht verloren.
+            DriveCommand cmd;
+            cmd.stage = KwlGroup::stageForShare(stage, fan->share());
+            cmd.deadTimeMs = static_cast<uint32_t>(grp.deadTime()) * 1000u;
+
+            cmd.direction = KwlGroup::directionFor(r, fan->phase());
+            cmd.hrv = r.hrv;
+            cmd.ramp = r.ramp;
+            fan->drive(mOutput, cmd);
+        }
+
+        if (!mOutput.ready())
+        {
+            // Die Luefter, die vor dem Fehler noch geschrieben wurden, stehen auf
+            // ihrer Stufe - und ohne weiteren Durchlauf blieben sie dort. Also
+            // alles in den sicheren Zustand, so gut es der Bus noch hergibt.
+            mError = mOutput.error();
+            logErrorP("Ausgabe fehlgeschlagen - Fehlercode %u", (unsigned)mError);
+            mOutput.safeAll();
+        }
+
+        const ErrorCode groupError =
+            mGroupTimedOut[group] ? ErrorCode::MasterTimeout : mError;
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+        {
+            KwlFan* fan = mFan[i];
+            if (fan == nullptr || !inSlot(i, group) || mFanConfigFault[i])
+                continue;
+
+            // Der Raum meldet Einschraenkungen (Feuchtevergleich, fehlende
+            // Messwerte, Schutz) - er hat aber kein eigenes Stoerungsobjekt.
+            // Ausgegeben werden sie an seinen Lueftern.
+            // Beim Slave nur der Schutz: seine Stufe kommt vom Master, also sind
+            // Feuchtevergleich und fehlende Sensoren des eigenen Raums fuer den
+            // Antrieb belanglos. Der Schutz dagegen haelt den Luefter an (siehe
+            // oben) - und ein Luefter, der dem Master nicht folgt, muss das sagen.
+            // Die Sperre meldet sich ueber den Status (Stufe 0), nicht als Fehler.
+            ErrorCode roomError = ErrorCode::None;
+            KwlRoom* room = openknxKwlRoomModule.room(fan->roomNo());
+            if (room != nullptr && room->isActive())
+            {
+                if (mGroupRole[group] != GroupRole::Slave)
+                    roomError = room->errorCode();
+                else if (room->stage().source == StageSource::Protection)
+                    roomError = ErrorCode::ProtectionActive;
+            }
+
+            fan->sendFault(r.conflict && r.conflictRoom == fan->roomNo(), groupError,
+                           roomError);
+        }
+    }
+
+    void KwlFanModule::driveConfigFaults()
+    {
+        // Konfigurationsfehler je Luefter (Verbund nicht aktiv, Typ oder
+        // Kalibrierfaktor ausserhalb, Kanal jenseits der Platine oder doppelt
+        // belegt): kein stilles Stehenbleiben (Invariante 10) - Fehlercode 3
+        // "Konfiguration" und, wo der Kanal eindeutig ist, der sichere Zustand.
+        // Einen doppelt belegten oder fehlenden Kanal fasst niemand an: er steht
+        // seit begin() auf seinem Stillstandswert.
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+        {
+            if (!mFanConfigFault[i] || mFan[i] == nullptr)
+                continue;
+            if (!mFanNoDrive[i])
+                mFan[i]->driveSafe(mOutput);
+            mFan[i]->sendFault(false, ErrorCode::Configuration, ErrorCode::None);
+        }
+    }
+
+    int8_t KwlFanModule::groupOf(GroupObject& ko) const
+    {
+        const int channel = FAN_KoCalcChannel(ko.asap());
+        if (channel < 0 || channel >= FAN_ChannelCount)
+            return -1;
+        for (uint8_t g = 0; g < kGroupsMax; g++)
+            if (mGroupSpeaker[g] == static_cast<int8_t>(channel))
+                return static_cast<int8_t>(g);
+        return -1;
+    }
+
+    void KwlFanModule::processInputKo(GroupObject& ko)
+    {
+        const int channel = FAN_KoCalcChannel(ko.asap());
+        if (channel < 0 || channel >= FAN_ChannelCount)
+            return;
+
+        // Gruppen-KOs gehoeren dem Verbund, nicht dem Luefter - auch wenn sie an
+        // seinem Kanal haengen. Ein Slave hoert darauf, ein Master und ein
+        // interner Verbund nicht: sonst wuerde er sich selbst folgen.
+        const int8_t group = groupOf(ko);
+        if (group >= 0 && mGroupRole[group] == GroupRole::Slave)
+        {
+            switch (koIndex(ko.asap()))
+            {
+                case FAN_KoGroupStage:
+                    mGroupRxStage[group] = ko.value(DPT_Value_1_Ucount);
+                    mGroupLastAlive[group] = millis();
+                    return;
+                case FAN_KoGroupTact:
+                    mGroupRxTact[group] = ko.value(DPT_Start);
+                    mGroupLastAlive[group] = millis();
+                    return;
+                case FAN_KoGroupAlive:
+                    mGroupLastAlive[group] = millis();
+                    return;
+                default:
+                    break;
+            }
+        }
+
+        if (mFan[channel] != nullptr)
+            mFan[channel]->processInputKo(ko);
+    }
+
+    // ------------------------------------------------------------ Flash
+
+    uint16_t KwlFanModule::flashSize()
+    {
+        // Versionsbyte, dann je Kanal ein Flagbyte und drei Zaehler. Die Groesse
+        // haengt an FAN_ChannelCount und nicht an der Platine: das Feld wird vom
+        // Framework vor setup() abgefragt, da steht die Hardwareauswahl noch nicht.
+        return 1 + FAN_ChannelCount * 13;
+    }
+
+    void KwlFanModule::writeFlash()
+    {
+        openknx.flash.writeByte(kFlashVersion);
+
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+        {
+            KwlFan::PersistentState s{};
+            if (mFan[i] != nullptr)
+                s = mFan[i]->persistentState();
+
+            openknx.flash.writeByte(s.flags);
+            openknx.flash.writeInt(s.runSeconds);
+            openknx.flash.writeInt(s.filterSeconds);
+            openknx.flash.writeInt(s.filterVolume);
+        }
+    }
+
+    void KwlFanModule::readFlash(const uint8_t* data, const uint16_t size)
+    {
+        (void)data;
+        if (size < flashSize())
+            return; // noch nichts oder ein aelteres Layout gespeichert
+
+        if (openknx.flash.readByte() != kFlashVersion)
+        {
+            logInfoP("Gespeicherte Daten haben eine andere Version, werden verworfen");
+            return;
+        }
+
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+        {
+            KwlFan::PersistentState s;
+            s.flags = openknx.flash.readByte();
+            s.runSeconds = openknx.flash.readInt();
+            s.filterSeconds = openknx.flash.readInt();
+            s.filterVolume = openknx.flash.readInt();
+
+            if (mFan[i] != nullptr)
+                mFan[i]->restore(s);
+        }
+    }
+
+    void KwlFanModule::processBeforeRestart()
+    {
+        // Sicherheitsinvariante 8: eine ETS-Neuprogrammierung darf keinen
+        // Vollgas-Moment erzeugen.
+        mOutput.safeAll();
+        logInfoP("Sicherer Zustand vor Neustart geschrieben");
+    }
+
+    void KwlFanModule::holdSafeUnconfigured(uint32_t now)
+    {
+        // Ohne Parametrierung gibt es keinen Sollwert, also schreibt auch niemand
+        // - und ein 12-V-Aus/Ein bliebe unbemerkt: die DACs kaemen mit 0 V =
+        // Volllast zurueck (Invariante 7). Genau das passiert bei der
+        // Erstinbetriebnahme, wenn der KNX-Bus vor den 12 V anliegt, oder wenn
+        // jemand vor dem Programmieren die 12 V aus- und wieder einschaltet.
+        //
+        // Deshalb alle 250 ms die volle Startsequenz: Adressabfrage,
+        // Bereichsregister, 5,00 V (Invariante 3). Sie ist idempotent; ein paar
+        // I2C-Frames je Viertelsekunde stoeren auch einen laufenden ETS-Download
+        // nicht. Bei einem neuen Board sind die Kanaltypen unbekannt, also gilt
+        // ueberall bipolar 5,00 V; waehrend eines ETS-Downloads gelten noch die
+        // Typen der alten Parametrierung (RA 15-60 bleibt auf 0 V).
+        if ((now - mRecoverLastMs) < kRecoverIntervalMs)
+            return;
+        mRecoverLastMs = now;
+
+        const bool wasReady = mOutput.ready();
+        const bool ok = mOutput.begin();
+        if (ok != wasReady)
+        {
+            if (ok)
+                logInfoP("Ohne Parametrierung: DAC erreichbar, alle Kanaele 5,00 V");
+            else
+                logErrorP("Ohne Parametrierung: DAC nicht erreichbar (12 V fehlen?)");
+        }
+    }
+
+    bool KwlFanModule::tryRecoverOutput(uint32_t now)
+    {
+        // 12-V-Ausfall bei stehendem KNX-Bus: der
+        // RP2040 laeuft weiter, die DACs sind stromlos, jeder Schreibversuch endet
+        // ohne ACK -> Fehlercode 4. Kommen die 12 V zurueck, starten die DACs mit
+        // ihrem Werkswert 0 V = VOLLLAST (Invariante 7, kein EEPROM). Ohne diesen
+        // Weg blieben sie dort bis zum naechsten Neustart, denn im Fehlerzweig
+        // schreibt niemand mehr.
+        //
+        // Also alle 250 ms dieselbe Startsequenz wie in setup(): Adressabfrage,
+        // Bereichsregister, sicherer Zustand (Invariante 3). Erst wenn sie ganz
+        // durchlaeuft, gilt der Fehler als behoben. Zwischen Wiederkehr der 12 V
+        // und Wiederaufnahme liegen also hoechstens gut 250 ms Werkswert.
+        //
+        // Nur DacUnreachable: ein Konfigurations- oder Hardwarefehler (Code 3)
+        // heilt nicht von selbst, und ein Parametrierfehler beim ego darf nicht in
+        // eine Schleife aus begin() und erneutem Scheitern laufen.
+        // Bewusst nur mError: nach einem Platinenfehler steht dort Configuration,
+        // auch wenn begin() danach zusaetzlich am DAC scheiterte - ein
+        // erfolgreiches begin() darf die falsche Platine nicht "heilen".
+        if (mError != ErrorCode::DacUnreachable)
+            return false;
+        if ((now - mRecoverLastMs) < kRecoverIntervalMs)
+            return false;
+        mRecoverLastMs = now;
+
+        if (!mOutput.begin())
+            return false;
+
+        // Die DACs kamen mit 0 V = Volllast zurueck. Bis jeder Kanal die
+        // Totzeit bei 5,00 V stand, bleibt er dort.
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+            if (mFan[i] != nullptr)
+                mFan[i]->restartGuard(now);
+
+        mError = ErrorCode::None;
+        logInfoP("DAC wieder erreichbar - Bereich und sicherer Zustand neu geschrieben");
+        return true;
+    }
+
+    void KwlFanModule::savePower()
+    {
+        // KNX-Bus weg, 12 V noch da: der RP2040 geht gleich aus, die DACs nicht.
+        // Sie halten den letzten Wert, bis der Bus zurueck ist - ohne diesen
+        // Aufruf liefe eine Badlueftung auf Stufe 4 stundenlang weiter. Vier
+        // kurze I2C-Frames, das passt in das Zeitfenster des SAVE-Interrupts.
+        mPowerSaved = true;
+        mOutput.safeAll();
+        const uint32_t now = millis();
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+            if (mFan[i] != nullptr)
+                mFan[i]->noteSafe(now);
+    }
+
+    bool KwlFanModule::restorePower()
+    {
+        // Kurzer Einbruch ohne Neustart: die DACs hatten die ganze Zeit Strom und
+        // stehen auf 5,00 V. loop() schreibt ab dem naechsten Durchlauf wieder
+        // Sollwerte. Der Takt stand in der Zwischenzeit, und von 5,00 V aus ist
+        // jede Richtung ein Anlauf, kein Wechsel.
+        mPowerSaved = false;
+        return true;
+    }
+
+    // ------------------------------------------------------------ Konsole
+
+    void KwlFanModule::printStatus()
+    {
+        logInfoP("Luefterkanaele:");
+        for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+            if (mFan[i] != nullptr)
+                mFan[i]->printStatusLine();
+
+        logInfoP("Busformat %s, Platine %u mit %u Kanaelen, Fehlercode %u",
+                 boardLeftAligned() ? "linksbuendig" : "rechtsbuendig",
+                 (unsigned)boardId(), (unsigned)boardChannels(),
+                 (unsigned)mError);
+    }
+
+    void KwlFanModule::printGroups()
+    {
+        logInfoP("Verbuende:");
+        for (uint8_t g = 0; g < kGroupsMax; g++)
+        {
+            if (!mGroupActive[g])
+                continue;
+            const GroupResult r = mGroup[g].result();
+            logInfoP("  %u: Stufe %u, Phase-0-Richtung %s, Zyklus %u s%s%s",
+                     (unsigned)(g + 1), (unsigned)r.stage,
+                     r.phase0Direction == Direction::Supply ? "Zuluft" : "Abluft",
+                     (unsigned)r.cycleSeconds, r.inDeadTime ? ", Totzeit" : "",
+                     r.conflict ? ", RICHTUNGSKONFLIKT" : "");
+        }
+    }
+
+    void KwlFanModule::showHelp()
+    {
+        openknx.console.printHelpLine("kwl st", "Alle Luefterkanaele je eine Zeile");
+        openknx.console.printHelpLine("kwl grp", "Verbuende mit Takt und Richtung");
+        openknx.console.printHelpLine("kwl fNN", "Luefter NN ausfuehrlich, z.B. kwl f1");
+        openknx.console.printHelpLine("kwl rNN", "Raum NN ausfuehrlich, z.B. kwl r1");
+    }
+
+    void KwlFanModule::printGroupsDiagnose()
+    {
+#ifdef BASE_KoDiagnose
+        // "G8 S4 Z 3600 K" = 14. K = Richtungskonflikt, T = Totzeit.
+        for (uint8_t g = 0; g < kGroupsMax; g++)
+        {
+            if (!mGroupActive[g])
+                continue;
+            const GroupResult r = mGroup[g].result();
+            openknx.console.writeDiagnoseKo("G%u S%u %c %u%s", (unsigned)(g + 1),
+                                            (unsigned)r.stage,
+                                            r.phase0Direction == Direction::Supply ? 'Z' : 'A',
+                                            (unsigned)r.cycleSeconds,
+                                            r.conflict ? " K" : r.inDeadTime ? " T" : "");
+            // Bei Massenausgabe verschluckt der Bus sonst jede zweite Zeile -
+            // dieselbe Abhilfe wie im Logikmodul.
+            openknx.console.writeDiagnoseKo("");
+        }
+#endif
+    }
+
+    bool KwlFanModule::processCommand(const std::string cmd, bool debugKo)
+    {
+        // debugKo: der Befehl kam ueber das Diagnose-KO, die Antwort geht dorthin
+        // zurueck - in Telegrammen zu 14 Zeichen. Ohne USB-Kabel der einzige Weg
+        // in ein Geraet im Schacht.
+
+        if (cmd.rfind("kwl", 0) != 0)
+            return false;
+
+        if (cmd == "kwl st")
+        {
+            if (debugKo)
+            {
+                for (uint8_t i = 0; i < FAN_ChannelCount; i++)
+                    if (mFan[i] != nullptr && mFan[i]->isActive())
+                    {
+                        mFan[i]->printDiagnose(false);
+#ifdef BASE_KoDiagnose
+                        openknx.console.writeDiagnoseKo("");
+#endif
+                    }
+                return true;
+            }
+            printStatus();
+            return true;
+        }
+
+        if (cmd == "kwl grp")
+        {
+            if (debugKo)
+                printGroupsDiagnose();
+            else
+                printGroups();
+            return true;
+        }
+
+        // "kwl f1" und "kwl r1". Die Nummern sind die der ETS, also ab 1 - beim
+        // Suchen an der Platine zaehlt niemand ab 0.
+        if (cmd.length() >= 6 && cmd.compare(0, 5, "kwl f") == 0)
+        {
+            const int no = atoi(cmd.c_str() + 5);
+            if (no < 1 || no > FAN_ChannelCount || mFan[no - 1] == nullptr)
+            {
+                logInfoP("Luefter %d gibt es nicht (1…%u)", no,
+                         (unsigned)FAN_ChannelCount);
+                return true;
+            }
+            if (debugKo)
+                mFan[no - 1]->printDiagnose(true);
+            else
+                mFan[no - 1]->printDetail();
+            return true;
+        }
+
+        if (cmd.length() >= 6 && cmd.compare(0, 5, "kwl r") == 0)
+        {
+            const int no = atoi(cmd.c_str() + 5);
+            KwlRoom* room = openknxKwlRoomModule.room(static_cast<uint8_t>(no));
+            if (room == nullptr)
+            {
+                logInfoP("Raum %d gibt es nicht (1…%u)", no,
+                         (unsigned)ROOM_ChannelCount);
+                return true;
+            }
+            if (debugKo)
+                room->printDiagnose(true);
+            else
+                room->printDetail();
+            return true;
+        }
+
+        return false;
+    }
+} // namespace Kwl

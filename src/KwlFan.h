@@ -1,0 +1,235 @@
+#pragma once
+
+#include "DirectionGuard.h"
+#include "KwlCurve.h"
+#include "KwlOutput.h"
+#include "KwlTypes.h"
+#include "SendCondition.h"
+#include "OpenKNX.h"
+
+namespace Kwl
+{
+    /// Was der Verbund diesem Luefter aufträgt. Als Struktur, weil die Liste noch
+    /// waechst und ein weiterer Parameter sonst jede Aufrufstelle anfasst.
+    struct DriveCommand
+    {
+        uint8_t stage;
+        Direction direction;
+        bool hrv; ///< Verbund pendelt im kurzen Zyklus
+        /// Totzeit des Takt-Platzes; der Luefter haelt sie auch je Kanal ein
+        /// (DirectionGuard), wenn die Spannung ohne Richtungswechsel des
+        /// Verbunds die Seite wechselt.
+        uint32_t deadTimeMs = 2000;
+        /// Rampe des Verbunds beim Richtungswechsel: Anteil des Ausschlags um
+        /// 5,00 V, 0…1. Wirkt nur bei bipolaren Typen.
+        float ramp = 1.0f;
+    };
+
+    // ========================================================================
+    // Ein Luefter. In der ETS ein Kanal des Moduls FAN.
+    //
+    // Der Kanal treibt, er entscheidet nicht: Stufe und Richtung kommen vom Raum
+    // (ueber StageArbiter) und vom Verbund (ueber KwlGroup). Hier wird daraus eine
+    // Spannung - und nur hier steht, welcher DAC-Kanal dazu gehoert.
+    //
+    // Zwei Korrekturen sitzen zwischen Kennlinie und Ausgabe:
+    //   * die **Leitungskompensation** gleicht den Spannungsabfall auf der
+    //     gemeinsamen Masse aus - was der Luefter sieht, nicht was die Klemme fuehrt
+    //   * der **Kalibrierfaktor** gleicht den Steigungsfehler des DAC-Kanals aus
+    // In dieser Reihenfolge: erst was am Luefter ankommen soll, dann was der
+    // Wandler dafuer ausgeben muss.
+    // ========================================================================
+    class KwlFan : public OpenKNX::Channel
+    {
+      public:
+        explicit KwlFan(uint8_t index);
+
+        const std::string name() override { return "KwlFan"; }
+
+        /// Persistenter Teil des Kanalzustands. Das Modul schreibt ihn in den
+        /// Flash - die Freigabe ist selbsthaltend und ueberlebt einen
+        /// Spannungsausfall, und ein Filterzaehler, der bei jedem Neustart von
+        /// vorn begaenne, waere wertlos.
+        struct PersistentState
+        {
+            uint8_t flags;         ///< Bit0 Freigabe empfangen, Bit1 suspendiert
+            uint32_t runSeconds;   ///< Betriebssekunden gesamt
+            uint32_t filterSeconds; ///< Laufzeit seit dem letzten Filterwechsel
+            uint32_t filterVolume; ///< m³ seit dem letzten Filterwechsel
+        };
+        static constexpr uint8_t kFlagEnabled = 0x01;
+        static constexpr uint8_t kFlagSuspended = 0x02;
+
+        void setup();
+        void loop();
+        void processInputKo(GroupObject& ko);
+
+        PersistentState persistentState() const;
+        void restore(const PersistentState& state);
+
+        /// Darf dieser Luefter ueberhaupt foerdern? Fehlt die Freigabe oder ist er
+        /// suspendiert, gibt es keine Stufe - das gewinnt gegen jede Bedienung.
+        bool blocked() const;
+
+        /// Anliegender Fehlercode, kleinster gewinnt. `moduleError` kommt vom
+        /// Modul (Konfiguration, DAC, Master-Timeout), `roomError` vom Raum
+        /// (Feuchtevergleich, fehlende Messwerte, Schutz) - der Luefter sieht
+        /// weder das eine noch das andere.
+        ErrorCode errorCode(bool groupConflict, ErrorCode moduleError,
+                            ErrorCode roomError) const;
+
+        /// Fehlercode und Stoerungs-KO senden, wenn sie sich geaendert haben.
+        void sendFault(bool groupConflict, ErrorCode moduleError, ErrorCode roomError);
+
+        /// Verbundzustand auf den Bus geben. Nur der Luefter mit der kleinsten
+        /// Nummer eines Verbunds tut das - er traegt dessen KOs.
+        void sendGroupState(uint8_t stage, bool tact);
+
+        /// Fuer die Geraete-LED und die Funktionstaste im Modul.
+        ErrorCode lastError() const { return mLastError; }
+        bool filterDue() const { return mFilterDue; }
+
+        /// Filterzaehler zuruecksetzen - vom Quittungsobjekt oder von der Taste.
+        void acknowledgeFilter();
+
+        bool isActive() const { return mActive; }
+
+        /// Parametrierung dieses Luefters unbrauchbar (Typ oder Kalibrierfaktor
+        /// ausserhalb des ETS-Bereichs, also ein kaputtes Abbild): nicht fahren,
+        /// Fehlercode 3, sicherer Zustand.
+        bool configFault() const { return mConfigFault; }
+        FanType type() const { return mType; }
+        uint8_t dacChannel() const { return mDacChannel; }
+        uint8_t roomNo() const { return mRoomNo; }
+        uint8_t groupNo() const { return mGroupNo; }
+        uint8_t phase() const { return mPhase; }
+        uint8_t share() const { return mShare; }
+        uint8_t stage() const { return mStage; }
+        Direction direction() const { return mDirection; }
+
+        /// Belegt dieser Luefter zwei DAC-Kanaele? Nur der ego tut das.
+        uint8_t channelsNeeded() const { return Curve::channelsNeeded(mType); }
+
+        /// Stufe und Richtung ausgeben. Welche Spannungshaelfte Zuluft ist, legt
+        /// der ETS-Parameter "Polaritaet" dieses Luefters fest.
+        bool drive(KwlOutput& output, const DriveCommand& cmd);
+
+        /// Foerdert dieser Luefter unter 5 V Zuluft? Standard ist nein.
+        bool below5vIsSupply() const { return mBelow5vIsSupply; }
+
+        /// Sicherer Zustand dieses Luefters, unabhaengig von allem anderen.
+        bool driveSafe(KwlOutput& output);
+
+        /// Totzeit im Pendeltakt: 5,00 V, aber Stufe und Status bleiben - die
+        /// Totzeit ist Teil der Pendelbewegung, kein Stillstand.
+        bool driveHold(KwlOutput& output);
+
+        /// Seite der Motoren unbekannt machen: nach Start und 12-V-Wiederkehr
+        /// gilt die volle Totzeit bei 5,00 V, bevor eine Seite hinaus darf.
+        void restartGuard(uint32_t now);
+
+        /// Die Ausgaenge stehen jetzt auf 5,00 V, ohne dass dieser Luefter sie
+        /// geschrieben hat (safeAll im SAVE-Interrupt).
+        void noteSafe(uint32_t now);
+
+        /// Ausgabe mit Auffrischung: schreibt nur bei Aenderung oder nach
+        /// kRefreshMs, beim ego als Paar.
+        bool writeOut(KwlOutput& output, const VoltPair& v, uint32_t now);
+
+        /// Eine Zeile fuer "kwl st".
+        void printStatusLine();
+
+        /// Ausfuehrliche Einzelansicht fuer "kwl fNN".
+        void printDetail();
+
+        /// Dasselbe fuers Diagnose-KO: je Zeile hoechstens 14 Zeichen, weil
+        /// DPT 16 nicht mehr traegt. `detail` haengt Kalibrierung und Filter an.
+        void printDiagnose(bool detail);
+
+        /// Restlaufzeit des Filters in Prozent, 0 wenn kein Filterzaehler laeuft.
+        uint8_t filterLeftPercent() const;
+
+      private:
+        /// Sollspannung am Luefter -> Spannung, die der DAC ausgeben muss.
+        float condition(float volt, uint8_t stage) const;
+
+        void sendStatus();
+        bool holdSafe(KwlOutput& output, uint32_t now);
+
+        bool mActive = false;
+        FanType mType = FanType::E2_60;
+        uint8_t mDacChannel = 0;
+        uint8_t mRoomNo = 1;
+        uint8_t mGroupNo = 1;
+        uint8_t mPhase = 0;
+        uint8_t mShare = 100;
+        bool mBelow5vIsSupply = false;
+
+        // Leitungskompensation
+        bool mCableComp = false;
+        float mCableResistance = 0.0f;  ///< Ohm, ein Leiter
+        float mCurrent[kStageMax + 1] = {}; ///< A je Stufe
+
+        /// Kalibrierfaktor, 10000 = 1,0000. Aus der Messung des Kanals.
+        float mCalib = 1.0f;
+        bool mConfigFault = false;
+
+        /// Nennvolumenstrom je Stufe in m³/h, aus der ETS.
+        uint8_t mFlow[kStageMax + 1] = {};
+
+        // --- Freigabe, Suspendierung, Zaehler ---------------------------------
+        bool mUseEnable = false;
+        bool mSuspendAllowed = false;
+        bool mEnableLatched = false;
+        bool mSuspended = false;
+
+        uint32_t mRunSeconds = 0;
+        uint32_t mFilterSeconds = 0;
+        uint32_t mFilterVolume = 0;
+        uint32_t mFilterVolumeRemainder = 0; ///< m³·s, noch keine volle m³
+        uint32_t mLastTick = 0;
+
+        uint8_t mFilterMode = 0;
+        uint32_t mFilterLimitSeconds = 0;
+        uint32_t mFilterLimitVolume = 0;
+        uint32_t mFilterRemindMs = 0;
+        bool mFilterDue = false;
+        bool mFilterMuted = false;
+        uint32_t mFilterMutedSince = 0;
+
+        ErrorCode mLastError = ErrorCode::None;
+        bool mFaultValid = false;
+
+        /// Zykluszeiten aus der ETS, 0 = aus.
+        uint32_t mSendCycleStatusMs = 0;
+        uint32_t mSendCycleHoursMs = 0;
+
+        Sent<uint16_t> mSentHours;
+        Sent<uint8_t> mSentFilterLeft;
+        Sent<bool> mSentFilterDue;
+
+        uint8_t mStage = 0;
+        Direction mDirection = Direction::Supply;
+        bool mHrv = false;
+        float mLastVolt = 0.0f;   ///< zuletzt geschrieben (Motor 1), mit Rampe
+        float mStatusVolt = 0.0f; ///< Ziel ohne Rampe - das meldet der Status
+        bool mStatusValid = false;
+
+        /// Totzeit je Motor: Motor 1 und beim ego Motor 2.
+        DirectionGuard mGuard[2];
+
+        // Zuletzt tatsaechlich geschriebener Wert und Zeitpunkt, fuer writeOut().
+        VoltPair mWritten{0.0f, 0.0f};
+        bool mWrittenValid = false;
+        uint32_t mWrittenMs = 0;
+
+        // Was zuletzt auf dem Bus war, je Statusobjekt. Gesendet wird nur bei
+        // Aenderung oder nach dem Zyklus "Status zyklisch senden".
+        Sent<uint8_t> mSentStage;
+        Sent<uint8_t> mSentStagePct;
+        Sent<bool> mSentDir;
+        Sent<bool> mSentHrv;
+        Sent<int32_t> mSentVoltMv;
+        Sent<int16_t> mSentFlow;
+    };
+} // namespace Kwl

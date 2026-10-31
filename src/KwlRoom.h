@@ -1,0 +1,271 @@
+#pragma once
+
+#include "MoistAir.h"
+#include "SendCondition.h"
+#include "OpenKNX.h"
+#include "StageArbiter.h"
+#include "StageLadder.h"
+#include "StageMap.h"
+#include "StatusText.h"
+#include "TempControl.h"
+
+namespace Kwl
+{
+    // ========================================================================
+    // Ein Raum. In der ETS ein Kanal des Moduls ROOM.
+    //
+    // Hier sitzt alles, was aus Messwerten und Bedienung eine Stufe macht: die
+    // Fuehrungen (rF, CO2, VOC, Temperatur), der Feuchtevergleich und die
+    // Vorfahrt. Der Raum treibt nichts - er liefert einen Stufenwunsch, den der
+    // Verbund und der Luefter weiterverarbeiten.
+    //
+    // Die Rechenschichten sind bewusst eigene Klassen und hier nur zusammengesetzt:
+    // sie sind ohne Hardware geprueft, dieser Kanal ist es nicht. Was hier steht,
+    // ist Verdrahtung - Parameter hinein, Ergebnis hinaus. Jede Regel, die man
+    // pruefen koennen muss, gehoert eine Ebene tiefer.
+    // ========================================================================
+    class KwlRoom : public OpenKNX::Channel
+    {
+      public:
+        explicit KwlRoom(uint8_t index);
+
+        const std::string name() override { return "KwlRoom"; }
+
+        void setup();
+        void loop();
+        void processInputKo(GroupObject& ko);
+
+        bool isActive() const { return mActive; }
+
+        /// Wirksame Stufe dieses Raums samt Herkunft. Das Luefter-Modul liest sie
+        /// in-process ab, nie ueber den Bus.
+        const StageResult& stage() const { return mStage; }
+
+        /// Deckel, den dieser Raum in die Verbundregel einbringt (groupCapFor,
+        /// Variante a): Maximalstufe der aktiven Betriebsart, nie unter der eigenen
+        /// Stufe. So erreicht auch der Nachtdeckel eines Raums den Verbund.
+        uint8_t groupCap() const { return groupCapFor(mStage.stage, mArbiter.modeParams(mStage.mode).maxStage); }
+
+        /// Welchen Takt dieser Raum wuenscht. Der Verbund entscheidet bei
+        /// Uneinigkeit nach seiner eigenen Regel.
+        CycleRule cycleWish() const { return mCycleWish; }
+
+        /// Fordert dieser Raum gerade Zuluft an? Solange er Abluft faehrt, muss
+        /// anderswo nachstroemen. Die Partner lesen das in-process, nicht ueber
+        /// den Bus - das KO gibt es zusaetzlich fuer fremde Geraete.
+        bool supplyRequested() const { return mSupplyReq; }
+
+        /// Aussenwerte fuer Raeume, die sie von Raum 1 uebernehmen. Die Werte
+        /// gelten fuer das ganze Haus; sie zweimal zu verknuepfen waere doppelte
+        /// Buslast und eine Fehlerquelle mehr.
+        bool hasOutdoor() const { return mHumOut.valid && mTempOut.valid; }
+        float humidityOut() const { return mHumOut.value; }
+        float tempOut() const { return mTempOut.value; }
+
+        /// Was dieser Raum an Einschraenkungen meldet. Die Luefter dieses Raums
+        /// geben es als Fehlercode aus - der Raum hat selbst keines.
+        ErrorCode errorCode() const;
+
+        /// Betriebsart fuer Raeume, die sie von Raum 1 uebernehmen.
+        OperatingMode activeMode() const { return mStage.mode; }
+
+        /// Vorgabe aus dem Objekt "Betriebsart" (Rang 10), ohne Ueberlagerungen.
+        /// Das uebernehmen die Raeume mit "Betriebsart von Raum 1".
+        OperatingMode modeSetpoint() const { return mArbiter.mode(); }
+
+        /// Zwangsbetriebsart vom Geraet aus (Funktionstaste). Laeuft ueber
+        /// denselben Weg wie das KO - mit Laufzeit und Ruecksetz-Semantik.
+        void forceModeFromDevice(OperatingMode mode, uint32_t now);
+        void clearForcedModeFromDevice(uint32_t now);
+        bool forcedModeActive(OperatingMode mode) const;
+
+        /// Eine Zeile fuer die Uebersicht.
+        void printStatusLine();
+
+        /// Ausfuehrliche Einzelansicht fuer "kwl rNN": warum die Stufe so ist,
+        /// wie sie ist. Beim Inbetriebnehmen die eigentliche Frage.
+        void printDetail();
+
+        /// Dasselbe fuers Diagnose-KO, in Zeilen zu 14 Zeichen.
+        void printDiagnose(bool detail);
+
+      private:
+        /// Ein Messwert vom Bus samt Alter. Ein Wert, der nie kam, ist nicht
+        /// dasselbe wie einer, der veraltet ist - beide sind aber ungueltig.
+        struct Sensor
+        {
+            float value = 0.0f;
+            uint32_t stamp = 0;
+            bool valid = false;
+
+            void set(float v, uint32_t now)
+            {
+                value = v;
+                stamp = now;
+                valid = true;
+            }
+        };
+
+        /// Messwert aus einem Objekt uebernehmen. DPT 9 kennt "ungueltig"
+        /// (0x7FFF); die Bibliothek liefert dafuer 0 - als Innentemperatur ein
+        /// Frostfall, als Aussentemperatur eine freie Kuehlung. Ungueltig heisst
+        /// deshalb hier: Messwert fehlt, wie bei einem Ausfall.
+        void readSensor(Sensor& s, GroupObject& ko, const Dpt& dpt, uint32_t now);
+
+        /// Freigaben und Vorgaben der gerade aktiven Betriebsart.
+        struct ModeFlags
+        {
+            bool leadHum;
+            bool leadCo2;
+            bool leadVoc;
+            bool leadTemp;
+            bool dehum;
+            bool frost;
+            bool interval;
+            uint8_t runOn;   ///< Nachlauf nach Anforderungsende in Minuten
+            uint8_t cycleWish;
+        };
+
+        /// Ablauf der Abluftanforderung (die Badlueftung).
+        enum class ExhaustState : uint8_t
+        {
+            Idle,   ///< keine Anforderung
+            Lead,   ///< Vorlaufzeit laeuft, noch nichts gefoerdert
+            Active, ///< foerdert Abluft
+            Lag     ///< Anforderung weg, Nachlaufzeit laeuft
+        };
+
+        /// Kein static: die Param-Makros rechnen ueber _channelIndex.
+        ModeFlags readModeFlags(OperatingMode mode) const;
+
+        void expireSensors(uint32_t now);
+        void runExhaust(const ModeFlags& flags, uint32_t now);
+        bool intervalActive(uint32_t now) const;
+        uint8_t applyRunOn(uint8_t guidance, uint8_t runOnMinutes, uint32_t now);
+        uint8_t runGuidance(OperatingMode mode, uint32_t now);
+        void applyCycleWish(uint8_t wish);
+        void sendStage();
+        void sendMode();
+        void sendModeExt();
+        void sendHumidity();
+        void sendOverlayFeedback();
+
+        bool mActive = false;
+
+        // Sperre (Rang 1). Beide Spielarten - Stillstand oder Grundstufe der
+        // Betriebsart - rechnet der Arbiter: StageArbiter::setLock(active,
+        // keepBase). Hier stehen nur die Eingangswerte, kein zweiter Rang-1-Pfad.
+        bool mLocked = false;
+        bool mLockKeepsBase = false;
+
+        /// Ueberwachungszeit der Sensoren in Millisekunden, 0 = keine.
+        uint32_t mSensorTimeout = 0;
+        /// true: bei fehlenden Messwerten Stillstand, false: Grundstufe weiter.
+        bool mStopOnMissing = false;
+        bool mSensorsMissing = false;
+
+        /// Stufe bei Entfeuchtung (ETS), Vorgabe 2.
+        uint8_t mDehumStage = 2;
+
+        /// Feste Richtung aus der Zyklusregel der Betriebsart: 0 keine,
+        /// 2 Zuluft, 3 Abluft - dieselbe Zaehlung wie das Betriebsweise-KO.
+        uint8_t mModeDirection = 0;
+
+        /// true: Aussenwerte und/oder Betriebsart kommen von Raum 1.
+        bool mOutdoorFromRoom1 = false;
+        bool mModeFromRoom1 = false;
+
+        /// 0 = ppb (9.008), 1 = Index 5.010, 2 = Index 7.001.
+        uint8_t mVocUnit = 0;
+        /// Hoehe ueber Meer in Metern, nur fuer die g/kg-Anzeige.
+        float mAltitude = 500.0f;
+
+        // Fuehrungen lassen sich einzeln vom Bus abschalten.
+        bool mLeadHumKo = true;
+        bool mLeadCo2Ko = true;
+        bool mLeadVocKo = true;
+        bool mLeadTempKo = true;
+
+        /// Objekt "Sommer" (1.001): waehlt den langen Zyklus, wenn die Betriebsart
+        /// die Entscheidung an dieses Objekt abgibt.
+        bool mSummer = false;
+        CycleRule mCycleWish = CycleRule::Wrg;
+
+        // Polaritaet der Bedienobjekte, fuer Bedienfelder, die umgekehrt
+        // senden. false = Standardverhalten.
+        bool mManualInverted = false; ///< KO "Handbetrieb aktiv": 1 = Automatik
+        bool mSummerInverted = false; ///< KO "Sommer": 1 = Waermerueckgewinnung
+        bool mForceOnZero = false;    ///< Zwangsobjekte 1-3 wirken bei 0
+
+        // Rueckmeldung der Ueberlagerungen. Die mKo-Merker halten,
+        // was das Objekt zuletzt trug - empfangen oder gesendet. Weicht der
+        // Arbiter davon ab, hat die Lueftung selbst geaendert (Laufzeit,
+        // Ruecksetzen); nur dann wird gesendet, nie beim Start.
+        bool mForceFeedback = false;  ///< Zwangsobjekte 1-3 melden zurueck
+        bool mNightFeedback = false;  ///< Nacht und Zwangsbetriebsart melden zurueck
+        bool mKoForce[4] = {false, false, false, false};
+        bool mKoNight = false;
+        uint8_t mKoForcedMode = 0;
+
+        // Klartext-Status
+        bool mStatusTextOn = false;
+        Lead mLeadNow = Lead::None;   ///< staerkste Fuehrung in diesem Durchlauf
+        Lead mLeadHold = Lead::None;  ///< dieselbe, aber ueber den Nachlauf gehalten
+        char mSentStatusText[kStatusTextSize] = {};
+
+        Sensor mHumIn, mTempIn, mHumOut, mTempOut, mCo2Val, mVocVal, mTempSet;
+
+        StageArbiter mArbiter;
+        StageLadder mHumidity;
+        StageLadder mCo2;
+        StageLadder mVoc;
+        StageMap mPercent;
+        TempControl mTemp;
+        HumidityCompare mCompare;
+
+        // --- Abluftanforderung (Rang 3) --------------------------------------
+        bool mExhaustReq = false;
+        ExhaustState mExhaust = ExhaustState::Idle;
+        uint32_t mExhaustSince = 0;
+        uint8_t mExhaustStage = 4;
+        uint32_t mExhaustLeadMs = 0;
+        uint32_t mExhaustLagMs = 0;
+        uint8_t mExhaustIntervalIdx = 0;
+        bool mSendSupplyReq = true;
+        bool mSupplyReq = false;
+
+        // --- Betriebsweise-KO (Rang 3) ---------------------------------------
+        /// 0 = auto, 1 = WRG, 2 = Zuluft, 3 = Abluft.
+        uint8_t mDirMode = 0;
+
+        // --- Intervallbetrieb (Rang 6) ---------------------------------------
+        uint32_t mIntervalPeriodMs = 0;
+        uint32_t mIntervalActiveMs = 0;
+        bool mIntervalRunning = false;
+
+        // --- Nachlauf nach Anforderungsende ----------------------------------
+        uint8_t mGuidanceHold = 0;
+        uint32_t mGuidanceHoldSince = 0;
+
+        // Was zuletzt auf dem Bus war. GroupObject::value() sendet immer, also
+        // wird hier entschieden statt dort.
+        Sent<uint8_t> mSentStage;
+        Sent<uint8_t> mSentPct;
+        Sent<uint8_t> mSentMode;
+        Sent<uint8_t> mSentModeExt;
+        Sent<uint8_t> mSentDirMode;
+        Sent<bool> mSentProtect;
+        Sent<bool> mSentDehumBlock;
+        Sent<bool> mSentInterval;
+        Sent<bool> mSentSupplyReq;
+        Sent<bool> mSentManualAct; ///< KO "Handbetrieb aktiv" als Ausgang
+        Sent<int32_t> mSentAbsIn;  ///< in 1/100 g/kg, fuer das Totband
+        Sent<int32_t> mSentAbsOut;
+
+        StageResult mStage{};
+        bool mProtection = false;
+        bool mFrostActive = false;  ///< Frostschutz wirkt (Bit 7 im HVAC-Status)
+        bool mDehumBlocked = false;      ///< Objekt 31: reiner Vergleich innen/aussen
+        bool mDehumBlockDemand = false;  ///< Fehlercode 7: Sperre unterdrueckt eine Anforderung
+    };
+} // namespace Kwl

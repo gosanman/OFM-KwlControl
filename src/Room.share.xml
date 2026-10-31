@@ -1,0 +1,308 @@
+<?xml version="1.0" encoding="utf-8"?>
+<KNX xmlns:op="http://github.com/OpenKNX/OpenKNXproducer" xmlns="http://knx.org/xml/project/20" CreatedBy="KNX MT" ToolVersion="5.1.255.16695">
+
+  <op:minOpenKNXproducerVersion value="4.3.9" />
+
+  <!-- ===================================================================================
+       Modul ROOM - geraeteweite Parameter und Parametertypen der Raumseiten.
+
+       Catalog, Code-Segment und Hardware stehen in Fan.share.xml; beide Module teilen sich
+       dieselbe ApplicationProgram-Id und duerfen das Geruest nicht doppelt aufspannen.
+
+       Dieses Modul hat bewusst KEINEN eigenen <Channel>: seine Kanalseiten haengt
+       Fan.share.xml per op:include mit prefix="ROOM" in den gemeinsamen Wurzelknoten
+       "Lueftung", damit Raeume und Luefter in der ETS als ein Modul erscheinen. Alles
+       Weitere dazu steht im Kopf von Fan.share.xml.
+
+       Aus demselben Grund werden die drei geraeteweiten Parameter unten nicht hier
+       angezeigt, sondern auf der Seite "Raeume" in Fan.share.xml - dort mit ausgeschriebener
+       Id (Modultyp 20), weil %TT% in jener Datei 30 waere.
+
+       Geraeteweites Speicherbild dieses Moduls:
+         Offset 0     PercentHysteresis
+         Offset 1..2  Altitude
+       =================================================================================== -->
+
+  <ManufacturerData>
+    <Manufacturer RefId="M-00FA">
+      <ApplicationPrograms>
+        <ApplicationProgram Id="%AID%" ApplicationNumber="1" ApplicationVersion="1" ReplacesVersions="0" ProgramType="ApplicationProgram" MaskVersion="MV-07B0" Name="KwlControl" LoadProcedureStyle="MergedProcedure" PeiType="0" DefaultLanguage="de" DynamicTableManagement="false" Linkable="true" MinEtsVersion="5.0">
+          <Static>
+            <ParameterTypes>
+
+              <!-- ===== Geraeteweit ===== -->
+              <ParameterType Id="%AID%_PT-RoomAltitude" Name="RoomAltitude">
+                <TypeNumber SizeInBit="16" Type="unsignedInt" minInclusive="0" maxInclusive="2000" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomPctHyst" Name="RoomPctHyst">
+                <TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="10" />
+              </ParameterType>
+
+              <!-- Auf 1 festgenagelter Parameter, nur als Vergleichsanker. Die ETS kann
+                   Sichtbarkeit nur gegen einen Parameter pruefen, nicht gegen die
+                   Kanalnummer - %C% ist eine Textersetzung des Producers. Der Test
+                   <when test="&lt;%C%"> wird dadurch je Kanal zu "1 &lt; 1" (falsch, Raum 1)
+                   bzw. "1 &lt; n" (wahr, Raum 2..8) und damit zu einer konstanten
+                   Kanalbedingung. -->
+              <ParameterType Id="%AID%_PT-RoomConstOne" Name="RoomConstOne">
+                <TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="1" maxInclusive="1" />
+              </ParameterType>
+
+              <!-- ===== Raumkanal ===== -->
+              <ParameterType Id="%AID%_PT-RoomChannelActive" Name="RoomChannelActive">
+                <TypeRestriction Base="Value" SizeInBit="1">
+                  <Enumeration Text="Deaktiviert" Value="0" Id="%ENID%" />
+                  <Enumeration Text="Aktiviert" Value="1" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <!-- Diagramme der Seite "Betriebsarten" (graphics/make_modes.py) -->
+              <ParameterType Id="%AID%_PT-RoomModeSelectPic" Name="RoomModeSelectPic">
+                <TypePicture RefId="%FILE-kwlmodeselect%" HorizontalAlignment="Left" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomStageFramePic" Name="RoomStageFramePic">
+                <TypePicture RefId="%FILE-kwlstageframe%" HorizontalAlignment="Left" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomYesNo" Name="RoomYesNo">
+                <TypeRestriction Base="Value" SizeInBit="1">
+                  <Enumeration Text="Nein" Value="0" Id="%ENID%" />
+                  <Enumeration Text="Ja" Value="1" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomOutdoorSource" Name="RoomOutdoorSource">
+                <TypeRestriction Base="Value" SizeInBit="1">
+                  <Enumeration Text="eigene Kommunikationsobjekte" Value="0" Id="%ENID%" />
+                  <Enumeration Text="von Raum 1 übernehmen" Value="1" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomModeSource" Name="RoomModeSource">
+                <TypeRestriction Base="Value" SizeInBit="1">
+                  <Enumeration Text="eigene Kommunikationsobjekte" Value="0" Id="%ENID%" />
+                  <Enumeration Text="Betriebsart von Raum 1 übernehmen" Value="1" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomMode4" Name="RoomMode4">
+                <TypeRestriction Base="Value" SizeInBit="3">
+                  <Enumeration Text="Komfort (anwesend)" Value="1" Id="%ENID%" />
+                  <Enumeration Text="Standby (abwesend, reduziert)" Value="2" Id="%ENID%" />
+                  <Enumeration Text="Nacht" Value="3" Id="%ENID%" />
+                  <Enumeration Text="Frost-/Gebäudeschutz" Value="4" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomStage14" Name="RoomStage14">
+                <TypeRestriction Base="Value" SizeInBit="3">
+                  <Enumeration Text="Stufe 1" Value="1" Id="%ENID%" />
+                  <Enumeration Text="Stufe 2" Value="2" Id="%ENID%" />
+                  <Enumeration Text="Stufe 3" Value="3" Id="%ENID%" />
+                  <Enumeration Text="Stufe 4" Value="4" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomManualTimeout" Name="RoomManualTimeout">
+                <TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="240" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomSensorTimeout" Name="RoomSensorTimeout">
+                <TypeNumber SizeInBit="16" Type="unsignedInt" minInclusive="0" maxInclusive="1440" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomOnMissing" Name="RoomOnMissing">
+                <TypeRestriction Base="Value" SizeInBit="1">
+                  <Enumeration Text="Grundstufe weiterfahren" Value="0" Id="%ENID%" />
+                  <Enumeration Text="Stillstand" Value="1" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+
+              <!-- Grenzwert-Treppen. Aufsteigende Werte sind Pflicht; die ETS kann das nicht
+                   erzwingen, die Firmware prueft es beim Start und meldet Fehlercode 3. -->
+              <ParameterType Id="%AID%_PT-RoomHumGW" Name="RoomHumGW">
+                <TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="90" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomCO2GW" Name="RoomCO2GW">
+                <TypeNumber SizeInBit="16" Type="unsignedInt" minInclusive="400" maxInclusive="4000" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomVOCGW" Name="RoomVOCGW">
+                <TypeNumber SizeInBit="16" Type="unsignedInt" minInclusive="0" maxInclusive="5000" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomVOCUnit" Name="RoomVOCUnit">
+                <TypeRestriction Base="Value" SizeInBit="2">
+                  <Enumeration Text="ppb (DPT 9.008)" Value="0" Id="%ENID%" />
+                  <Enumeration Text="Index 0…255 (DPT 5.010)" Value="1" Id="%ENID%" />
+                  <Enumeration Text="Index 0…65535 (DPT 7.001)" Value="2" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+
+              <!-- Feuchtevergleich in 0,1 hPa Dampfdruckdifferenz. Der Vergleich selbst ist
+                   hoehenunabhaengig; die Hoehe braucht nur die Anzeige in g/kg. -->
+              <ParameterType Id="%AID%_PT-RoomDehumHpa" Name="RoomDehumHpa">
+                <TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="50" />
+              </ParameterType>
+
+              <ParameterType Id="%AID%_PT-RoomFrostTemp" Name="RoomFrostTemp">
+                <TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="5" maxInclusive="16" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomHeatTemp" Name="RoomHeatTemp">
+                <TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="26" maxInclusive="40" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomTempGap" Name="RoomTempGap">
+                <TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="10" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomTempLeadMode" Name="RoomTempLeadMode">
+                <TypeRestriction Base="Value" SizeInBit="1">
+                  <Enumeration Text="Eingang — eine 0 sperrt die Temperaturführung" Value="0" Id="%ENID%" />
+                  <Enumeration Text="Ausgang — meldet freie Kühlung (Heizungssperre)" Value="1" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+
+              <!-- ===== Betriebsarten (Teil 2) ===== -->
+              <ParameterType Id="%AID%_PT-RoomStage04" Name="RoomStage04">
+                <TypeRestriction Base="Value" SizeInBit="3">
+                  <Enumeration Text="Stillstand" Value="0" Id="%ENID%" />
+                  <Enumeration Text="Stufe 1" Value="1" Id="%ENID%" />
+                  <Enumeration Text="Stufe 2" Value="2" Id="%ENID%" />
+                  <Enumeration Text="Stufe 3" Value="3" Id="%ENID%" />
+                  <Enumeration Text="Stufe 4" Value="4" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomCycleWish" Name="RoomCycleWish">
+                <TypeRestriction Base="Value" SizeInBit="3">
+                  <Enumeration Text="über das Objekt „Sommer“" Value="0" Id="%ENID%" />
+                  <Enumeration Text="Wärmerückgewinnung (kurzer Zyklus)" Value="1" Id="%ENID%" />
+                  <Enumeration Text="Sommer (langer Zyklus)" Value="2" Id="%ENID%" />
+                  <Enumeration Text="feste Richtung Zuluft" Value="3" Id="%ENID%" />
+                  <Enumeration Text="feste Richtung Abluft" Value="4" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomRunOn" Name="RoomRunOn">
+                <TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="60" />
+              </ParameterType>
+
+              <!-- ===== Zwangsobjekte, Nacht, Intervall, Abluft ===== -->
+              <ParameterType Id="%AID%_PT-RoomMode7" Name="RoomMode7">
+                <TypeRestriction Base="Value" SizeInBit="3">
+                  <Enumeration Text="Komfort (anwesend)" Value="1" Id="%ENID%" />
+                  <Enumeration Text="Standby (abwesend, reduziert)" Value="2" Id="%ENID%" />
+                  <Enumeration Text="Nacht" Value="3" Id="%ENID%" />
+                  <Enumeration Text="Frost-/Gebäudeschutz" Value="4" Id="%ENID%" />
+                  <Enumeration Text="Stoßlüften" Value="5" Id="%ENID%" />
+                  <Enumeration Text="Temperatur-Absenkung" Value="6" Id="%ENID%" />
+                  <Enumeration Text="Ruhe (Aus)" Value="7" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomNightMode" Name="RoomNightMode">
+                <TypeRestriction Base="Value" SizeInBit="3">
+                  <Enumeration Text="Nacht" Value="3" Id="%ENID%" />
+                  <Enumeration Text="Temperatur-Absenkung" Value="6" Id="%ENID%" />
+                  <Enumeration Text="Ruhe (Aus)" Value="7" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomForcePrio" Name="RoomForcePrio">
+                <TypeRestriction Base="Value" SizeInBit="1">
+                  <Enumeration Text="gleichrangig — das zuletzt empfangene gewinnt" Value="0" Id="%ENID%" />
+                  <Enumeration Text="hierarchisch — 1 vor 2 vor 3" Value="1" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomForceTimeout" Name="RoomForceTimeout">
+                <TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="240" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomIntervalPeriod" Name="RoomIntervalPeriod">
+                <TypeNumber SizeInBit="16" Type="unsignedInt" minInclusive="30" maxInclusive="1440" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomIntervalActive" Name="RoomIntervalActive">
+                <TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="5" maxInclusive="120" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomExhaustLead" Name="RoomExhaustLead">
+                <TypeNumber SizeInBit="16" Type="unsignedInt" minInclusive="0" maxInclusive="300" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomExhaustLag" Name="RoomExhaustLag">
+                <TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="60" />
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomExhaustInterval" Name="RoomExhaustInterval">
+                <TypeRestriction Base="Value" SizeInBit="4">
+                  <Enumeration Text="dauernd" Value="0" Id="%ENID%" />
+                  <Enumeration Text="1 min je 5 min" Value="1" Id="%ENID%" />
+                  <Enumeration Text="2 min je 5 min" Value="2" Id="%ENID%" />
+                  <Enumeration Text="1 min je 15 min" Value="3" Id="%ENID%" />
+                  <Enumeration Text="2 min je 15 min" Value="4" Id="%ENID%" />
+                  <Enumeration Text="5 min je 15 min" Value="5" Id="%ENID%" />
+                  <Enumeration Text="1 min je 30 min" Value="6" Id="%ENID%" />
+                  <Enumeration Text="2 min je 30 min" Value="7" Id="%ENID%" />
+                  <Enumeration Text="5 min je 30 min" Value="8" Id="%ENID%" />
+                  <Enumeration Text="10 min je 30 min" Value="9" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomLockBehaviour" Name="RoomLockBehaviour">
+                <TypeRestriction Base="Value" SizeInBit="1">
+                  <Enumeration Text="Stillstand" Value="0" Id="%ENID%" />
+                  <Enumeration Text="Grundstufe der Betriebsart" Value="1" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <!-- Polaritaet der Bedienobjekte, fuer Bedienfelder, die
+                   Automatik, WRG oder Ein/Aus umgekehrt senden. Wert 0 = Standard. -->
+              <ParameterType Id="%AID%_PT-RoomManualPolarity" Name="RoomManualPolarity">
+                <TypeRestriction Base="Value" SizeInBit="1">
+                  <Enumeration Text="1 = Handbetrieb" Value="0" Id="%ENID%" />
+                  <Enumeration Text="1 = Automatik" Value="1" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomSummerPolarity" Name="RoomSummerPolarity">
+                <TypeRestriction Base="Value" SizeInBit="1">
+                  <Enumeration Text="1 = langer Zyklus (Sommer)" Value="0" Id="%ENID%" />
+                  <Enumeration Text="1 = Wärmerückgewinnung" Value="1" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+              <ParameterType Id="%AID%_PT-RoomForcePolarity" Name="RoomForcePolarity">
+                <TypeRestriction Base="Value" SizeInBit="1">
+                  <Enumeration Text="1" Value="0" Id="%ENID%" />
+                  <Enumeration Text="0" Value="1" Id="%ENID%" />
+                </TypeRestriction>
+              </ParameterType>
+
+            </ParameterTypes>
+            <Parameters>
+              <!-- Kein "Anzahl der Raeume" mehr: ein Raum erscheint im Baum, weil er
+                   aktiviert ist, nicht weil ein Zaehler hoch genug steht
+                   (OpenKNX-Kanalauswahl-Pattern). -->
+              <Union SizeInBit="24">
+                <Memory CodeSegment="%AID%_RS-04-00000" Offset="0" BitOffset="0" />
+                <Parameter Id="%AID%_UP-%TT%00002" Name="PercentHysteresis" Offset="0" BitOffset="0" ParameterType="%AID%_PT-RoomPctHyst" Text="Hysterese Prozent → Stufe" SuffixText=" %" Value="3" />
+                <Parameter Id="%AID%_UP-%TT%00003" Name="Altitude" Offset="1" BitOffset="0" ParameterType="%AID%_PT-RoomAltitude" Text="Höhe über Meer" SuffixText=" m" Value="500" />
+              </Union>
+              <!-- Access="None" haelt ihn unsichtbar. Er MUSS zusaetzlich im Dynamic-Teil
+                   per ParameterRefRef vorkommen - sonst gilt er in der ETS als nicht
+                   vorhanden, und jedes choose darauf nimmt keinen Zweig, auch nicht den
+                   Default. Raum 1 verliert dann seine Aussenwert-Objekte KO 36/37, und
+                   "Quellen" bleibt leer.
+                   Genau EIN ParameterRefRef: er steht in Fan.share.xml, Seite "Allgemein".
+                   Auf der Raumseite waere er achtmal vorhanden, einmal je Kanal. -->
+              <Parameter Id="%AID%_P-%TT%00004" Name="ConstOne" ParameterType="%AID%_PT-RoomConstOne" Text="" Value="1" Access="None" />
+            </Parameters>
+            <ParameterRefs>
+              <ParameterRef Id="%AID%_P-%TT%00004_R-%TT%0000401" RefId="%AID%_P-%TT%00004" />
+              <ParameterRef Id="%AID%_UP-%TT%00002_R-%TT%0000201" RefId="%AID%_UP-%TT%00002" />
+              <ParameterRef Id="%AID%_UP-%TT%00003_R-%TT%0000301" RefId="%AID%_UP-%TT%00003" />
+            </ParameterRefs>
+            <ComObjectTable>
+              <!-- Keine geraeteweiten Kommunikationsobjekte: alles haengt am Raumkanal
+                   (Room.templ.xml). -->
+            </ComObjectTable>
+          </Static>
+          <Dynamic>
+            <!-- Kein eigener Channel - siehe Kopfkommentar. Die Raumseiten haengt
+                 Fan.share.xml in den Knoten "Lueftung" ein. -->
+          </Dynamic>
+        </ApplicationProgram>
+      </ApplicationPrograms>
+      <Baggages>
+        <Baggage TargetPath="" Name="Help_de.zip" Id="%FILE-HELP-de%">
+          <FileInfo TimeInfo="%DATETIME%" />
+        </Baggage>
+        <Baggage Id="%FILE-ICONS%" Name="Icons.zip" TargetPath="">
+          <FileInfo TimeInfo="%DATETIME%" />
+        </Baggage>
+        <Baggage Id="%FILE-kwlmodeselect%" Name="kwlmodeselect.png" TargetPath="">
+          <FileInfo TimeInfo="%DATETIME%" />
+        </Baggage>
+        <Baggage Id="%FILE-kwlstageframe%" Name="kwlstageframe.png" TargetPath="">
+          <FileInfo TimeInfo="%DATETIME%" />
+        </Baggage>
+      </Baggages>
+    </Manufacturer>
+  </ManufacturerData>
+</KNX>

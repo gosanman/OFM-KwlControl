@@ -1,0 +1,943 @@
+// Tests der Vorfahrt.
+//
+// Jede Zeile der Rangtabelle ist ein Testfall, dazu die Ruecksetz-Semantik (eine
+// Nutzeraktion auf Rang >= 5 setzt hoehere Raenge bis 5 zurueck, Rang 1-4 nie)
+// und zwei Bedienbeispiele.
+//
+//   1 Sperre · 2 Schutz · 3 Zu-/Abluftanforderung · 4 Verbund · 5 Handstufe ·
+//   6 Automatikstufe · 7 Zwangsobjekte · 8 Nacht · 9 Zwangsbetriebsart ·
+//   10 Betriebsart · 11 Standard
+//
+// Vorgaben: Standard Standby {Grund 1, Max 2} · Eco {1,1} · Komfort {1,4} ·
+// Stosslueften {4,4} · Ruhe {0,0} · Zwangsobjekt 1 Stosslueften 30 min,
+// 2 Ruhe unendlich, 3 Komfort 30 min.
+
+#include <unity.h>
+
+#include "StageArbiter.h"
+#include "KwlGroup.h"
+
+using namespace Kwl;
+
+namespace
+{
+    constexpr uint32_t kMinute = 60000u;
+} // namespace
+
+void setUp(void) {}
+void tearDown(void) {}
+
+// ---------------------------------------------------------------- Rang 6 zuerst
+
+static void test_grundstufe_laeuft_immer(void)
+{
+    // Ohne jede Anforderung laeuft die Grundstufe der Standard-Betriebsart.
+    StageArbiter a;
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(1, r.stage);
+    TEST_ASSERT_EQUAL(StageSource::Automatic, r.source);
+    TEST_ASSERT_EQUAL(OperatingMode::Standby, r.mode);
+    TEST_ASSERT_EQUAL_UINT8(11, r.modeRank);
+}
+
+static void test_fuehrung_hebt_an_maximalstufe_deckelt(void)
+{
+    StageArbiter a;
+    a.setGuidanceStage(2);
+    TEST_ASSERT_EQUAL_UINT8(2, a.update(0).stage);
+
+    // Standby deckelt bei 2 - die Fuehrung kommt nicht darueber.
+    a.setGuidanceStage(4);
+    TEST_ASSERT_EQUAL_UINT8(2, a.update(0).stage);
+
+    // In Komfort (Deckel 4) dieselbe Fuehrung voll.
+    a.setMode(OperatingMode::Comfort, 0);
+    TEST_ASSERT_EQUAL_UINT8(4, a.update(0).stage);
+}
+
+static void test_nachtdeckel_ist_der_zweck_des_projekts(void)
+{
+    // Eco deckelt bei Stufe 1. Eine CO2-Treppe auf Stufe 4 darf im Schlafzimmer
+    // nicht durchschlagen.
+    StageArbiter a;
+    a.setGuidanceStage(4);
+    a.setNight(true, 0);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL(OperatingMode::Eco, r.mode);
+    TEST_ASSERT_EQUAL_UINT8(1, r.stage);
+}
+
+static void test_grundstufe_ueber_maximalstufe_wird_gedeckelt(void)
+{
+    // Fehlparametrierung: Grundstufe 4 bei Deckel 2. Gedeckelt, nicht durchgelassen.
+    StageArbiter a;
+    a.setModeParams(OperatingMode::Standby, {4, 2});
+    TEST_ASSERT_EQUAL_UINT8(2, a.update(0).stage);
+}
+
+// ---------------------------------------------------------------- Raenge 1 bis 5
+
+static void test_rang5_hand_ersetzt_automatik(void)
+{
+    StageArbiter a;
+    a.setGuidanceStage(2);
+    a.setManualStage(0, 0);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(0, r.stage);
+    TEST_ASSERT_EQUAL(StageSource::Manual, r.source);
+}
+
+static void test_hand_wird_nicht_von_der_maximalstufe_gedeckelt(void)
+{
+    // Auslegung, siehe StageArbiter.h: der Deckel schuetzt vor der Automatik,
+    // nicht vor dem Bewohner. Wer nachts bewusst Stufe 3 drueckt, bekommt sie.
+    StageArbiter a;
+    a.setNight(true, 0); // Eco, Deckel 1
+    a.setManualStage(3, 0);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(3, r.stage);
+    TEST_ASSERT_EQUAL(StageSource::Manual, r.source);
+    TEST_ASSERT_EQUAL(OperatingMode::Eco, r.mode); // die Betriebsart bleibt Nacht
+}
+
+static void test_rang4_verbund_schlaegt_hand(void)
+{
+    StageArbiter a;
+    a.setManualStage(1, 0);
+    a.setGroupStage(true, 3, Direction::Exhaust);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(3, r.stage);
+    TEST_ASSERT_EQUAL(StageSource::Group, r.source);
+    TEST_ASSERT_TRUE(r.directionForced);
+    TEST_ASSERT_EQUAL(Direction::Exhaust, r.direction);
+}
+
+static void test_rang3_anforderung_schlaegt_verbund_und_erzwingt_richtung(void)
+{
+    StageArbiter a;
+    a.setManualStage(1, 0);
+    a.setGroupStage(true, 3, Direction::Exhaust);
+    a.setAirDemand(true, Direction::Supply, 2);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(2, r.stage);
+    TEST_ASSERT_EQUAL(StageSource::AirDemand, r.source);
+    TEST_ASSERT_TRUE(r.directionForced);
+    TEST_ASSERT_EQUAL(Direction::Supply, r.direction);
+}
+
+static void test_rang2_schutz_schlaegt_alles_darunter(void)
+{
+    // Ein durchfrierender Raum ist kein Bedienfall: Schutz steht ueber der Bedienung.
+    StageArbiter a;
+    a.setManualStage(4, 0);
+    a.setGroupStage(true, 3, Direction::Exhaust);
+    a.setAirDemand(true, Direction::Supply, 2);
+    a.setProtection(true);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(0, r.stage); // Schutzstufe, Vorgabe 0
+    TEST_ASSERT_EQUAL(StageSource::Protection, r.source);
+    TEST_ASSERT_FALSE(r.directionForced);
+}
+
+static void test_schutzstufe_ist_parametrierbar(void)
+{
+    StageArbiter a;
+    a.setProtectionStage(1);
+    a.setProtection(true);
+    TEST_ASSERT_EQUAL_UINT8(1, a.update(0).stage);
+}
+
+static void test_rang1_sperre_gewinnt_gegen_alles(void)
+{
+    StageArbiter a;
+    a.setManualStage(4, 0);
+    a.setGroupStage(true, 4, Direction::Exhaust);
+    a.setAirDemand(true, Direction::Supply, 4);
+    a.setProtection(true);
+    a.setProtectionStage(4);
+    a.setLock(true);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(0, r.stage);
+    TEST_ASSERT_EQUAL(StageSource::Lock, r.source);
+    TEST_ASSERT_FALSE(r.directionForced);
+}
+
+static void test_sperre_mit_grundstufe(void)
+{
+    // ETS-Sperrverhalten "Grundstufe der Betriebsart": nicht Stillstand, sondern
+    // die Grundstufe - und zwar aus dem Arbiter heraus, nicht nachtraeglich im
+    // Raum gedeckelt. Rang 1 bleibt eine Stelle (Invariante 9).
+    StageArbiter a;
+    a.setGuidanceStage(2);
+    a.setManualStage(4, 0);
+    a.setLock(true, true);
+
+    StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(1, r.stage); // Standby-Grundstufe
+    TEST_ASSERT_EQUAL(StageSource::Lock, r.source);
+    TEST_ASSERT_FALSE(r.directionForced);
+
+    // Grundstufe 0 bleibt 0 - gedeckelt, nicht erzwungen.
+    a.setModeParams(OperatingMode::Standby, {0, 2});
+    TEST_ASSERT_EQUAL_UINT8(0, a.update(0).stage);
+
+    // Ohne keepBase weiterhin Stillstand.
+    a.setModeParams(OperatingMode::Standby, {1, 2});
+    a.setLock(true, false);
+    TEST_ASSERT_EQUAL_UINT8(0, a.update(0).stage);
+}
+
+static void test_sperre_faellt_weg_und_die_ebene_darunter_uebernimmt(void)
+{
+    StageArbiter a;
+    a.setGuidanceStage(2);
+    a.setLock(true);
+    TEST_ASSERT_EQUAL_UINT8(0, a.update(0).stage);
+    a.setLock(false);
+    TEST_ASSERT_EQUAL_UINT8(2, a.update(0).stage);
+}
+
+// ---------------------------------------------------------------- Betriebsarten
+
+// ---------------------------------------------------------------- Richtungsvorgabe
+
+static void test_richtungsvorgabe_ohne_stufe(void)
+{
+    // Das Betriebsweise-KO sagt nur, wohin gefoerdert wird. Die Stufe bleibt die,
+    // die ohne es gegolten haette.
+    StageArbiter a;
+    a.setGuidanceStage(2);
+    TEST_ASSERT_FALSE(a.update(0).directionForced);
+
+    a.setDirectionOverride(true, Direction::Exhaust);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(2, r.stage);
+    TEST_ASSERT_EQUAL(StageSource::Automatic, r.source);
+    TEST_ASSERT_TRUE(r.directionForced);
+    TEST_ASSERT_EQUAL(Direction::Exhaust, r.direction);
+}
+
+static void test_richtungsvorgabe_gilt_auch_fuer_hand_und_verbund(void)
+{
+    // Sie steht auf Rang 3 und damit ueber Verbund und Handstufe.
+    StageArbiter a;
+    a.setDirectionOverride(true, Direction::Supply);
+
+    a.setManualStage(3, 0);
+    StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL(StageSource::Manual, r.source);
+    TEST_ASSERT_EQUAL(Direction::Supply, r.direction);
+
+    a.setGroupStage(true, 2, Direction::Exhaust);
+    r = a.update(0);
+    TEST_ASSERT_EQUAL(StageSource::Group, r.source);
+    TEST_ASSERT_EQUAL(Direction::Supply, r.direction); // Rang 3 vor Rang 4
+}
+
+static void test_anforderung_schlaegt_die_richtungsvorgabe(void)
+{
+    // Beide sind Rang 3; die Anforderung ist die konkretere Aussage, weil sie
+    // auch eine Stufe nennt.
+    StageArbiter a;
+    a.setDirectionOverride(true, Direction::Supply);
+    a.setAirDemand(true, Direction::Exhaust, 4);
+
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL(StageSource::AirDemand, r.source);
+    TEST_ASSERT_EQUAL_UINT8(4, r.stage);
+    TEST_ASSERT_EQUAL(Direction::Exhaust, r.direction);
+}
+
+static void test_sperre_hat_keine_richtung(void)
+{
+    StageArbiter a;
+    a.setDirectionOverride(true, Direction::Exhaust);
+    a.setLock(true);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(0, r.stage);
+    TEST_ASSERT_FALSE(r.directionForced);
+}
+
+// ---------------------------------------------------------------- Intervall
+
+static void test_automatik_stillgelegt(void)
+{
+    // Intervallbetrieb in der Pause: Rang 6 gibt 0 aus, Grundstufe eingeschlossen.
+    StageArbiter a;
+    a.setGuidanceStage(3);
+    TEST_ASSERT_EQUAL_UINT8(2, a.update(0).stage); // Standby deckelt bei 2
+
+    a.setAutomaticSuppressed(true);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(0, r.stage);
+    TEST_ASSERT_EQUAL(StageSource::Automatic, r.source);
+
+    a.setAutomaticSuppressed(false);
+    TEST_ASSERT_EQUAL_UINT8(2, a.update(0).stage);
+}
+
+static void test_fuehrung_null_ist_kein_stillstand(void)
+{
+    // Die Falle: wer "Stillstand" erreichen will, darf nicht den Fuehrungswunsch
+    // auf 0 setzen. Rang 6 rechnet max(Grundstufe, Fuehrung), und die Grundstufe
+    // laeuft weiter - genau das war der Fehler bei "bei fehlenden Messwerten".
+    StageArbiter a;
+    a.setGuidanceStage(0);
+    TEST_ASSERT_EQUAL_UINT8(1, a.update(0).stage); // Standby-Grundstufe
+
+    // Nur das Stilllegen von Rang 6 erreicht wirklich Stufe 0.
+    a.setAutomaticSuppressed(true);
+    TEST_ASSERT_EQUAL_UINT8(0, a.update(0).stage);
+
+    // Und bei einer Betriebsart mit Grundstufe 0 sieht man den Unterschied nicht -
+    // deshalb steht hier Standby und nicht Ruhe.
+    a.setAutomaticSuppressed(false);
+    a.setModeParams(OperatingMode::Standby, {0, 2});
+    TEST_ASSERT_EQUAL_UINT8(0, a.update(0).stage);
+}
+
+static void test_stilllegung_schlaegt_nicht_hand_und_schutz(void)
+{
+    // Die Pause ist eine Sparmassnahme, kein Sicherheitsfall - sie darf eine
+    // Bedienung oder einen Schutzfall nicht ueberstimmen.
+    StageArbiter a;
+    a.setAutomaticSuppressed(true);
+
+    a.setManualStage(3, 0);
+    TEST_ASSERT_EQUAL_UINT8(3, a.update(0).stage);
+
+    a.setManualActive(false, 0);
+    a.setProtectionStage(1);
+    a.setProtection(true);
+    TEST_ASSERT_EQUAL_UINT8(1, a.update(0).stage);
+}
+
+static void test_rangfolge_der_betriebsartebenen(void)
+{
+    StageArbiter a;
+
+    // 11: Standard
+    TEST_ASSERT_EQUAL_UINT8(11, a.update(0).modeRank);
+
+    // 10: Betriebsart
+    a.setMode(OperatingMode::Comfort, 0);
+    TEST_ASSERT_EQUAL_UINT8(10, a.update(0).modeRank);
+    TEST_ASSERT_EQUAL(OperatingMode::Comfort, a.result().mode);
+
+    // 9: Zwangsbetriebsart
+    a.setForcedMode(OperatingMode::Reduction, 0);
+    TEST_ASSERT_EQUAL_UINT8(9, a.update(0).modeRank);
+    TEST_ASSERT_EQUAL(OperatingMode::Reduction, a.result().mode);
+
+    // 8: Nacht
+    a.setNight(true, 0);
+    TEST_ASSERT_EQUAL_UINT8(8, a.update(0).modeRank);
+    TEST_ASSERT_EQUAL(OperatingMode::Eco, a.result().mode);
+
+    // 7: Zwangsobjekt
+    a.setForcedObjectState(1, true, 0);
+    TEST_ASSERT_EQUAL_UINT8(7, a.update(0).modeRank);
+    TEST_ASSERT_EQUAL(OperatingMode::Boost, a.result().mode);
+    TEST_ASSERT_EQUAL_UINT8(4, a.result().stage); // Stosslueften {4,4}
+}
+
+static void test_auto_faellt_auf_die_standard_betriebsart(void)
+{
+    StageArbiter a;
+    a.setStandardMode(OperatingMode::Comfort);
+    a.setMode(OperatingMode::Quiet, 0);
+    TEST_ASSERT_EQUAL_UINT8(0, a.update(0).stage); // Ruhe {0,0}
+
+    a.setMode(OperatingMode::Auto, 0);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL(OperatingMode::Comfort, r.mode);
+    TEST_ASSERT_EQUAL_UINT8(11, r.modeRank);
+}
+
+// ---------------------------------------------------------------- Bedienbeispiele
+
+static void test_bedienbeispiel_1_auto_nacht_zwangsobjekt(void)
+{
+    // "Auto -> Nacht -> Zwangsobjekt 1: Zwangsobjekt 1 aktiv; nach Ablauf wieder
+    // Nacht." Das Zwangsobjekt steht ueber der Nacht, loescht sie aber nicht.
+    StageArbiter a;
+    a.setNight(true, 0);
+    TEST_ASSERT_EQUAL(OperatingMode::Eco, a.update(0).mode);
+
+    a.setForcedObjectState(1, true, 1000);
+    TEST_ASSERT_EQUAL(OperatingMode::Boost, a.update(1000).mode);
+
+    // Laufzeit 30 min: eine Millisekunde vorher noch Stosslueften.
+    TEST_ASSERT_EQUAL(OperatingMode::Boost, a.update(1000 + 30 * kMinute - 1).mode);
+
+    // Nach Ablauf faellt er auf die naechste noch aktive Ebene - die Nacht.
+    const StageResult r = a.update(1000 + 30 * kMinute);
+    TEST_ASSERT_EQUAL(OperatingMode::Eco, r.mode);
+    TEST_ASSERT_EQUAL_UINT8(8, r.modeRank);
+}
+
+static void test_bedienbeispiel_2_auto_zwangsobjekt_nacht(void)
+{
+    // "Auto -> Zwangsobjekt 1 -> Nacht: Nacht loescht Zwangsobjekt 1; nach
+    // Ruecknahme Auto." Die Nacht liegt tiefer im Rang, ihre Bedienung setzt aber
+    // die hoeheren Ebenen zurueck - sonst bliebe die Taste wirkungslos.
+    StageArbiter a;
+    a.setForcedObjectState(1, true, 0);
+    TEST_ASSERT_EQUAL(OperatingMode::Boost, a.update(0).mode);
+
+    a.setNight(true, 1000);
+    const StageResult r = a.update(1000);
+    TEST_ASSERT_EQUAL(OperatingMode::Eco, r.mode);
+    TEST_ASSERT_EQUAL_UINT8(8, r.modeRank);
+
+    // Nach Ruecknahme der Nacht bleibt nichts uebrig: zurueck auf Auto/Standard.
+    a.setNight(false, 2000);
+    const StageResult s = a.update(2000);
+    TEST_ASSERT_EQUAL(OperatingMode::Standby, s.mode);
+    TEST_ASSERT_EQUAL_UINT8(11, s.modeRank);
+}
+
+// ---------------------------------------------------------------- Ruecksetzen
+
+static void test_bedienung_setzt_hoehere_ebenen_zurueck(void)
+{
+    // Rang 10 aendert sich: alles von 5 bis 9 faellt.
+    StageArbiter a;
+    a.setManualStage(4, 0);
+    a.setForcedObjectState(2, true, 0);
+    a.setNight(true, 0);
+    a.setForcedMode(OperatingMode::Boost, 0);
+
+    a.setMode(OperatingMode::Comfort, 1000);
+    const StageResult r = a.update(1000);
+    TEST_ASSERT_EQUAL(OperatingMode::Comfort, r.mode);
+    TEST_ASSERT_EQUAL_UINT8(10, r.modeRank);
+    TEST_ASSERT_FALSE(a.manualActive());
+    TEST_ASSERT_EQUAL(StageSource::Automatic, r.source);
+}
+
+static void test_sperre_laesst_sich_nicht_wegbedienen(void)
+{
+    // Raenge 1 bis 4 sind vom Ruecksetzen ausgenommen.
+    StageArbiter a;
+    a.setLock(true);
+    a.setMode(OperatingMode::Boost, 0);
+    a.setManualStage(4, 0);
+    a.setNight(true, 0);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL(StageSource::Lock, r.source);
+    TEST_ASSERT_EQUAL_UINT8(0, r.stage);
+}
+
+static void test_gleicher_wert_setzt_nichts_zurueck(void)
+{
+    // Eine Wiederholung desselben Objektwerts ist keine Aenderung - sonst wuerde
+    // ein zyklisch sendender Schaltaktor den Handbetrieb dauernd loeschen.
+    StageArbiter a;
+    a.setNight(true, 0);
+    a.setManualStage(3, 0);
+    TEST_ASSERT_TRUE(a.manualActive());
+
+    a.setNight(true, 1000); // derselbe Wert
+    TEST_ASSERT_TRUE(a.manualActive());
+
+    a.setNight(false, 2000); // jetzt eine Aenderung
+    TEST_ASSERT_FALSE(a.manualActive());
+}
+
+// ---------------------------------------------------------------- Zwangsobjekte
+
+static void test_zwangsobjekte_gleichrangig_letztes_gewinnt(void)
+{
+    StageArbiter a; // Vorgabe: gleichrangig
+    a.setForcedObjectState(1, true, 0); // Stosslueften
+    TEST_ASSERT_EQUAL(OperatingMode::Boost, a.update(0).mode);
+
+    a.setForcedObjectState(3, true, 1000); // Komfort
+    TEST_ASSERT_EQUAL(OperatingMode::Comfort, a.update(1000).mode);
+
+    // Das zuletzt eingeschaltete faellt weg - das noch anstehende uebernimmt,
+    // nicht die naechste Ebene.
+    a.setForcedObjectState(3, false, 2000);
+    TEST_ASSERT_EQUAL(OperatingMode::Boost, a.update(2000).mode);
+}
+
+static void test_zwangsobjekte_hierarchisch(void)
+{
+    // "hierarchisch - 1 vor 2 vor 3", so steht es in der ETS: die kleinste Nummer
+    // gewinnt, unabhaengig davon, welche zuletzt kam.
+    StageArbiter a;
+    a.setForcedObjectHierarchical(true);
+    a.setForcedObject(2, OperatingMode::Quiet, 0);
+
+    a.setForcedObjectState(3, true, 0); // Komfort
+    TEST_ASSERT_EQUAL(OperatingMode::Comfort, a.update(0).mode);
+
+    a.setForcedObjectState(1, true, 100); // Stosslueften - kleinere Nummer, gewinnt
+    TEST_ASSERT_EQUAL(OperatingMode::Boost, a.update(100).mode);
+
+    a.setForcedObjectState(2, true, 150); // Ruhe - dazwischen, aendert nichts
+    TEST_ASSERT_EQUAL(OperatingMode::Boost, a.update(150).mode);
+
+    a.setForcedObjectState(1, false, 200); // faellt weg -> jetzt gilt 2
+    TEST_ASSERT_EQUAL(OperatingMode::Quiet, a.update(200).mode);
+
+    a.setForcedObjectState(2, false, 300); // und danach 3
+    TEST_ASSERT_EQUAL(OperatingMode::Comfort, a.update(300).mode);
+}
+
+static void test_zwangsobjekt_ohne_laufzeit_bleibt(void)
+{
+    // Zwangsobjekt 2 ist per Vorgabe Ruhe ohne Ablauf - fuer den Fensterkontakt.
+    StageArbiter a;
+    a.setForcedObjectState(2, true, 0);
+    TEST_ASSERT_EQUAL(OperatingMode::Quiet, a.update(0).mode);
+    TEST_ASSERT_EQUAL(OperatingMode::Quiet, a.update(48u * 60u * kMinute).mode);
+    TEST_ASSERT_EQUAL_UINT8(0, a.result().stage);
+}
+
+static void test_zwangsobjekt_belegung_parametrierbar(void)
+{
+    StageArbiter a;
+    a.setForcedObject(1, OperatingMode::Quiet, 5 * kMinute);
+    a.setForcedObjectState(1, true, 0);
+    TEST_ASSERT_EQUAL(OperatingMode::Quiet, a.update(0).mode);
+    TEST_ASSERT_EQUAL(OperatingMode::Quiet, a.update(5 * kMinute - 1).mode);
+    TEST_ASSERT_EQUAL(OperatingMode::Standby, a.update(5 * kMinute).mode);
+}
+
+// ---------------------------------------------------------------- Laufzeiten
+
+static void test_handstufe_laeuft_ab(void)
+{
+    StageArbiter a; // Vorgabe 60 min
+    a.setGuidanceStage(2);
+    a.setManualStage(0, 0);
+    TEST_ASSERT_EQUAL_UINT8(0, a.update(0).stage);
+    TEST_ASSERT_EQUAL_UINT8(0, a.update(60 * kMinute - 1).stage);
+
+    const StageResult r = a.update(60 * kMinute);
+    TEST_ASSERT_EQUAL_UINT8(2, r.stage);
+    TEST_ASSERT_EQUAL(StageSource::Automatic, r.source);
+}
+
+static void test_handstufe_dauerhaft(void)
+{
+    StageArbiter a;
+    a.setManualRuntime(0);
+    a.setGuidanceStage(2);
+    a.setManualStage(0, 0);
+    TEST_ASSERT_EQUAL_UINT8(0, a.update(24u * 60u * kMinute).stage);
+}
+
+static void test_handbetrieb_ein_uebernimmt_die_laufende_stufe(void)
+{
+    // KO "Handbetrieb aktiv" = 1 ohne vorherige Handstufe: der Handbetrieb friert
+    // die gerade laufende Stufe ein. Die alte Handstufe (ab Werk 0) wuerde den
+    // Luefter anhalten - etwa bei einem Bedienfeld mit "Automatik aus"
+    // (invertierte Polaritaet).
+    StageArbiter a;
+    a.setGuidanceStage(2);
+    TEST_ASSERT_EQUAL_UINT8(2, a.update(0).stage);
+
+    a.setManualActive(true, 1000);
+    const StageResult r = a.update(1000);
+    TEST_ASSERT_TRUE(a.manualActive());
+    TEST_ASSERT_EQUAL_UINT8(2, r.stage);
+    TEST_ASSERT_EQUAL(StageSource::Manual, r.source);
+
+    // Die Fuehrung aendert sich - die Handstufe bleibt.
+    a.setGuidanceStage(4);
+    TEST_ASSERT_EQUAL_UINT8(2, a.update(2000).stage);
+}
+
+static void test_handbetrieb_ein_bei_laufendem_handbetrieb_aendert_nichts(void)
+{
+    // Ist der Handbetrieb schon aktiv, gilt weiter die gesetzte Handstufe.
+    StageArbiter a;
+    a.setGuidanceStage(1);
+    a.setManualStage(3, 0);
+    a.update(0);
+    a.setManualActive(true, 500);
+    TEST_ASSERT_EQUAL_UINT8(3, a.update(500).stage);
+}
+
+static void test_handbetrieb_per_null_beenden(void)
+{
+    // KO "Handbetrieb aktiv" ist Ein- und Ausgang; eine 0 vom Bus beendet sofort.
+    StageArbiter a;
+    a.setGuidanceStage(2);
+    a.setManualStage(4, 0);
+    TEST_ASSERT_EQUAL_UINT8(4, a.update(0).stage);
+
+    a.setManualActive(false, 1000);
+    TEST_ASSERT_EQUAL_UINT8(2, a.update(1000).stage);
+}
+
+static void test_zwangsbetriebsart_laeuft_ab(void)
+{
+    StageArbiter a;
+    a.setForcedModeRuntime(120 * kMinute);
+    a.setMode(OperatingMode::Comfort, 0);
+    a.setForcedMode(OperatingMode::Quiet, 1000);
+    TEST_ASSERT_EQUAL(OperatingMode::Quiet, a.update(1000).mode);
+
+    const StageResult r = a.update(1000 + 120 * kMinute);
+    TEST_ASSERT_EQUAL(OperatingMode::Comfort, r.mode);
+    TEST_ASSERT_EQUAL_UINT8(10, r.modeRank);
+}
+
+// ---------------------------------------------------------------- Rueckmeldung
+// Die Objekte Zwangsobjekt 1-3, Nacht und Zwangsbetriebsart melden ihren Zustand
+// zurueck, wenn die Lueftung ihn selbst aendert. Der Raum vergleicht
+// dafuer diese drei Abfragen mit dem, was das Objekt zuletzt trug.
+
+static void test_rueckmeldung_zustand_nach_ablauf(void)
+{
+    StageArbiter a;
+    a.setForcedModeRuntime(30 * kMinute);
+    a.setForcedObjectState(1, true, 0);        // Stosslueften, 30 min
+    TEST_ASSERT_TRUE(a.forcedObjectActive(1));
+    TEST_ASSERT_FALSE(a.forcedObjectActive(2));
+    a.update(30 * kMinute - 1);
+    TEST_ASSERT_TRUE(a.forcedObjectActive(1));
+    a.update(30 * kMinute);
+    TEST_ASSERT_FALSE(a.forcedObjectActive(1));
+
+    a.setForcedMode(OperatingMode::Quiet, 0);
+    TEST_ASSERT_EQUAL_UINT8(7, a.forcedModeValue());
+    a.update(30 * kMinute);
+    TEST_ASSERT_EQUAL_UINT8(0, a.forcedModeValue());
+}
+
+static void test_rueckmeldung_zustand_nach_ruecksetzen(void)
+{
+    // Ruhe per Zwangsobjekt 2 (unendlich), dann Nacht: Nacht loescht den Zwang.
+    // Dann eine Betriebsart: sie loescht die Nacht.
+    StageArbiter a;
+    a.setForcedObjectState(2, true, 0);
+    TEST_ASSERT_TRUE(a.forcedObjectActive(2));
+    a.setNight(true, 1000);
+    TEST_ASSERT_FALSE(a.forcedObjectActive(2));
+    TEST_ASSERT_TRUE(a.nightActive());
+
+    a.setForcedMode(OperatingMode::Comfort, 2000);
+    TEST_ASSERT_FALSE(a.nightActive());
+    TEST_ASSERT_EQUAL_UINT8(1, a.forcedModeValue());
+
+    a.setMode(OperatingMode::Standby, 3000);
+    TEST_ASSERT_EQUAL_UINT8(0, a.forcedModeValue());
+
+    // Ungueltige Nummern melden "nicht aktiv", statt ausserhalb zu lesen.
+    TEST_ASSERT_FALSE(a.forcedObjectActive(0));
+    TEST_ASSERT_FALSE(a.forcedObjectActive(4));
+}
+
+static void test_laufzeit_ueber_den_millis_ueberlauf(void)
+{
+    // millis() laeuft nach 49,7 Tagen ueber. Eine Laufzeit darf dabei weder sofort
+    // ablaufen noch haengenbleiben.
+    StageArbiter a;
+    a.setManualRuntime(10 * kMinute);
+    const uint32_t start = 0xFFFFFF00u;
+    a.setManualStage(4, start);
+
+    TEST_ASSERT_EQUAL_UINT8(4, a.update(start + 10 * kMinute - 1).stage);
+    TEST_ASSERT_EQUAL(StageSource::Automatic,
+                      a.update(start + 10 * kMinute).source);
+}
+
+// ---------------------------------------------------------------- Taster
+
+static void test_schritt_hoch_und_runter(void)
+{
+    StageArbiter a;
+    a.setGuidanceStage(1); // wirksam ist Stufe 1
+    TEST_ASSERT_EQUAL_UINT8(1, a.update(0).stage);
+
+    // Der erste Schritt geht von der sichtbaren Stufe aus, nicht von 0.
+    a.stepManual(+1, 0);
+    TEST_ASSERT_EQUAL_UINT8(2, a.update(0).stage);
+    a.stepManual(+1, 0);
+    TEST_ASSERT_EQUAL_UINT8(3, a.update(0).stage);
+    a.stepManual(-1, 0);
+    TEST_ASSERT_EQUAL_UINT8(2, a.update(0).stage);
+}
+
+static void test_schritt_klemmt_an_den_enden(void)
+{
+    StageArbiter a;
+    a.setManualStage(4, 0);
+    a.stepManual(+1, 0);
+    TEST_ASSERT_EQUAL_UINT8(4, a.update(0).stage);
+
+    a.setManualStage(0, 0);
+    a.stepManual(-1, 0);
+    TEST_ASSERT_EQUAL_UINT8(0, a.update(0).stage);
+}
+
+// ---------------------------------------------------------------- Randfaelle
+
+static void test_stufen_werden_geklemmt(void)
+{
+    StageArbiter a;
+    a.setManualStage(9, 0);
+    TEST_ASSERT_EQUAL_UINT8(kStageMax, a.update(0).stage);
+
+    a.setManualActive(false, 0);
+    a.setAirDemand(true, Direction::Supply, 200);
+    TEST_ASSERT_EQUAL_UINT8(kStageMax, a.update(0).stage);
+}
+
+static void test_reset(void)
+{
+    StageArbiter a;
+    a.setLock(true);
+    a.setManualStage(4, 0);
+    a.setNight(true, 0);
+    a.reset();
+    const StageResult r = a.result();
+    TEST_ASSERT_EQUAL_UINT8(1, r.stage); // Standby-Grundstufe
+    TEST_ASSERT_EQUAL(StageSource::Automatic, r.source);
+    TEST_ASSERT_EQUAL(OperatingMode::Standby, r.mode);
+}
+
+// ---------------------------------------------------------------- Verbunddeckel
+// Deckel = Maximalstufe der Betriebsart, nie unter der eigenen Stufe. Ginge an
+// den Verbund immer kStageMax, erreichte der Nachtdeckel des Schlafzimmers den
+// Verbund nie.
+
+static uint8_t capOf(const StageArbiter& a, const StageResult& r)
+{
+    return groupCapFor(r.stage, a.modeParams(r.mode).maxStage);
+}
+
+static void test_verbunddeckel_nacht_automatik_deckelt_auf_eins(void)
+{
+    StageArbiter a;
+    a.setNight(true, 0); // Eco {1,1}
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(1, r.stage);
+    TEST_ASSERT_EQUAL_UINT8(1, capOf(a, r));
+}
+
+static void test_verbunddeckel_eigene_hand_hebt_den_deckel(void)
+{
+    // Handstufe 3 im Nachtraum: der Raum deckelt den Verbund nicht unter 3.
+    StageArbiter a;
+    a.setNight(true, 0);
+    a.setManualStage(3, 0);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(3, r.stage);
+    TEST_ASSERT_EQUAL_UINT8(3, capOf(a, r));
+}
+
+static void test_verbunddeckel_nie_unter_der_maximalstufe(void)
+{
+    // Hand 0 in Standby {1,2}: Stufe 0, aber der Deckel bleibt 2 - ein Raum, der
+    // selbst nichts will, drueckt den Nachbarn nicht auf 0.
+    StageArbiter a;
+    a.setManualStage(0, 0);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(0, r.stage);
+    TEST_ASSERT_EQUAL_UINT8(2, capOf(a, r));
+}
+
+static void test_verbunddeckel_sperre_deckelt_den_verbund_nicht(void)
+{
+    StageArbiter a;
+    a.setLock(true);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(0, r.stage);
+    TEST_ASSERT_EQUAL_UINT8(2, capOf(a, r));
+}
+
+// ---------------------------------------------------------------- je Luefter
+// Sperre und Schutz wirken je Luefter, auch im Verbund. Der Luefter eines
+// gesperrten Raums faehrt nicht die Verbundstufe des Nachbarn weiter.
+
+static void test_sperre_stoppt_den_luefter_trotz_verbund(void)
+{
+    StageArbiter a;
+    a.setLock(true);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL(StageSource::Lock, r.source);
+    // Nachbar haelt den Verbund auf 3 - der gesperrte Raum steht trotzdem.
+    TEST_ASSERT_EQUAL_UINT8(0, fanStageInGroup(3, r.source, r.stage));
+}
+
+static void test_sperre_mit_grundstufe_faehrt_die_grundstufe(void)
+{
+    StageArbiter a;
+    a.setLock(true, true); // Standby-Grundstufe 1
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL_UINT8(1, r.stage);
+    TEST_ASSERT_EQUAL_UINT8(1, fanStageInGroup(4, r.source, r.stage));
+}
+
+static void test_schutz_stoppt_den_luefter_trotz_verbund(void)
+{
+    StageArbiter a;
+    a.setProtection(true);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL(StageSource::Protection, r.source);
+    TEST_ASSERT_EQUAL_UINT8(r.stage, fanStageInGroup(3, r.source, r.stage));
+}
+
+static void test_ohne_sperre_gilt_die_verbundstufe(void)
+{
+    // Hand, Automatik, Anforderung und Verbund selbst: der Luefter folgt dem Verbund.
+    StageArbiter a;
+    a.setManualStage(0, 0);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL(StageSource::Manual, r.source);
+    TEST_ASSERT_EQUAL_UINT8(2, fanStageInGroup(2, r.source, r.stage));
+    TEST_ASSERT_FALSE(roomOverridesGroup(StageSource::Automatic));
+    TEST_ASSERT_FALSE(roomOverridesGroup(StageSource::Group));
+}
+
+static void test_abluftanforderung_wird_vom_nachbardeckel_nicht_begrenzt(void)
+{
+    // Raum 1 fordert Abluft Stufe 4, Raum 2 steht auf Standby (Deckel 2). Der
+    // Verbund rechnet min(4, 2) = 2 - der Luefter im Bad faehrt trotzdem 4
+    // (Rang 1-4 gilt je Luefter nach der Verbundbildung).
+    StageArbiter bad;
+    bad.setAirDemand(true, Direction::Exhaust, 4);
+    const StageResult r = bad.update(0);
+    TEST_ASSERT_EQUAL(StageSource::AirDemand, r.source);
+    TEST_ASSERT_TRUE(roomOverridesGroup(StageSource::AirDemand));
+    TEST_ASSERT_EQUAL_UINT8(4, fanStageInGroup(2, r.source, r.stage));
+}
+
+static void test_anteil_gilt_auch_bei_sperre_mit_grundstufe(void)
+{
+    // Unpaariger Aufbau (3 x e2 60): ein Luefter mit 50 % Anteil. Raum gesperrt
+    // mit "Grundstufe", Betriebsart Stosslueften (Grundstufe 4). Erst die
+    // Uebersteuerung, dann der Anteil: 4 -> 2. Die Reihenfolge ist die aus
+    // KwlFanModule::driveGroup().
+    StageArbiter a;
+    a.setForcedMode(OperatingMode::Boost, 0);
+    a.setLock(true, true);
+    const StageResult r = a.update(0);
+    TEST_ASSERT_EQUAL(StageSource::Lock, r.source);
+    TEST_ASSERT_EQUAL_UINT8(4, r.stage);
+    TEST_ASSERT_EQUAL_UINT8(2, KwlGroup::stageForShare(fanStageInGroup(3, r.source, r.stage), 50));
+}
+
+// ---------------------------------------------------------------- HVAC-Status
+// Objekt 28 meldet das Bitfeld nach MDT-Schema.
+
+static void test_hvac_status_grundarten(void)
+{
+    TEST_ASSERT_EQUAL_HEX8(0x01, hvacStatusByte(OperatingMode::Comfort, false));
+    TEST_ASSERT_EQUAL_HEX8(0x02, hvacStatusByte(OperatingMode::Standby, false));
+    TEST_ASSERT_EQUAL_HEX8(0x04, hvacStatusByte(OperatingMode::Eco, false));
+    TEST_ASSERT_EQUAL_HEX8(0x08, hvacStatusByte(OperatingMode::Protection, false));
+}
+
+static void test_hvac_status_erweiterte_arten(void)
+{
+    // Stossluefen -> Komfort, Absenkung -> Nacht, Ruhe -> Schutz.
+    TEST_ASSERT_EQUAL_HEX8(0x01, hvacStatusByte(OperatingMode::Boost, false));
+    TEST_ASSERT_EQUAL_HEX8(0x04, hvacStatusByte(OperatingMode::Reduction, false));
+    TEST_ASSERT_EQUAL_HEX8(0x08, hvacStatusByte(OperatingMode::Quiet, false));
+}
+
+static void test_hvac_status_frostbit(void)
+{
+    TEST_ASSERT_EQUAL_HEX8(0x82, hvacStatusByte(OperatingMode::Standby, true));
+    TEST_ASSERT_EQUAL_HEX8(0x80, hvacStatusByte(OperatingMode::Auto, true));
+}
+
+// ---------------------------------------------------------------- Vorgabe fuer Folgeraeume
+
+static void test_vorgabe_ohne_ueberlagerung(void)
+{
+    // mode() ist die Vorgabe aus dem Objekt "Betriebsart" (Rang 10). Nacht,
+    // Zwangsobjekt und Zwangsbetriebsart aendern die wirksame Betriebsart, nicht
+    // die Vorgabe - nur sie uebernimmt ein Raum "von Raum 1".
+    StageArbiter a;
+    TEST_ASSERT_EQUAL(OperatingMode::Auto, a.mode());
+    a.setMode(OperatingMode::Comfort, 0);
+    TEST_ASSERT_EQUAL(OperatingMode::Comfort, a.mode());
+
+    a.setNight(true, 1000);
+    TEST_ASSERT_EQUAL(OperatingMode::Eco, a.update(1000).mode);
+    TEST_ASSERT_EQUAL(OperatingMode::Comfort, a.mode());
+
+    a.setForcedObjectState(1, true, 2000);
+    TEST_ASSERT_EQUAL(OperatingMode::Boost, a.update(2000).mode);
+    TEST_ASSERT_EQUAL(OperatingMode::Comfort, a.mode());
+
+    a.setForcedMode(OperatingMode::Quiet, 3000);
+    TEST_ASSERT_EQUAL(OperatingMode::Quiet, a.update(3000).mode);
+    TEST_ASSERT_EQUAL(OperatingMode::Comfort, a.mode());
+
+    a.setMode(OperatingMode::Auto, 4000);
+    TEST_ASSERT_EQUAL(OperatingMode::Auto, a.mode());
+    TEST_ASSERT_EQUAL(OperatingMode::Standby, a.update(4000).mode);
+}
+
+int main(int, char**)
+{
+    UNITY_BEGIN();
+    RUN_TEST(test_sperre_stoppt_den_luefter_trotz_verbund);
+    RUN_TEST(test_sperre_mit_grundstufe_faehrt_die_grundstufe);
+    RUN_TEST(test_schutz_stoppt_den_luefter_trotz_verbund);
+    RUN_TEST(test_ohne_sperre_gilt_die_verbundstufe);
+    RUN_TEST(test_abluftanforderung_wird_vom_nachbardeckel_nicht_begrenzt);
+    RUN_TEST(test_anteil_gilt_auch_bei_sperre_mit_grundstufe);
+    RUN_TEST(test_hvac_status_grundarten);
+    RUN_TEST(test_hvac_status_erweiterte_arten);
+    RUN_TEST(test_hvac_status_frostbit);
+    RUN_TEST(test_verbunddeckel_nacht_automatik_deckelt_auf_eins);
+    RUN_TEST(test_verbunddeckel_eigene_hand_hebt_den_deckel);
+    RUN_TEST(test_verbunddeckel_nie_unter_der_maximalstufe);
+    RUN_TEST(test_verbunddeckel_sperre_deckelt_den_verbund_nicht);
+    RUN_TEST(test_grundstufe_laeuft_immer);
+    RUN_TEST(test_fuehrung_hebt_an_maximalstufe_deckelt);
+    RUN_TEST(test_nachtdeckel_ist_der_zweck_des_projekts);
+    RUN_TEST(test_grundstufe_ueber_maximalstufe_wird_gedeckelt);
+    RUN_TEST(test_rang5_hand_ersetzt_automatik);
+    RUN_TEST(test_hand_wird_nicht_von_der_maximalstufe_gedeckelt);
+    RUN_TEST(test_rang4_verbund_schlaegt_hand);
+    RUN_TEST(test_rang3_anforderung_schlaegt_verbund_und_erzwingt_richtung);
+    RUN_TEST(test_rang2_schutz_schlaegt_alles_darunter);
+    RUN_TEST(test_schutzstufe_ist_parametrierbar);
+    RUN_TEST(test_rang1_sperre_gewinnt_gegen_alles);
+    RUN_TEST(test_sperre_mit_grundstufe);
+    RUN_TEST(test_sperre_faellt_weg_und_die_ebene_darunter_uebernimmt);
+    RUN_TEST(test_richtungsvorgabe_ohne_stufe);
+    RUN_TEST(test_richtungsvorgabe_gilt_auch_fuer_hand_und_verbund);
+    RUN_TEST(test_anforderung_schlaegt_die_richtungsvorgabe);
+    RUN_TEST(test_sperre_hat_keine_richtung);
+    RUN_TEST(test_automatik_stillgelegt);
+    RUN_TEST(test_fuehrung_null_ist_kein_stillstand);
+    RUN_TEST(test_stilllegung_schlaegt_nicht_hand_und_schutz);
+    RUN_TEST(test_rangfolge_der_betriebsartebenen);
+    RUN_TEST(test_auto_faellt_auf_die_standard_betriebsart);
+    RUN_TEST(test_bedienbeispiel_1_auto_nacht_zwangsobjekt);
+    RUN_TEST(test_bedienbeispiel_2_auto_zwangsobjekt_nacht);
+    RUN_TEST(test_bedienung_setzt_hoehere_ebenen_zurueck);
+    RUN_TEST(test_sperre_laesst_sich_nicht_wegbedienen);
+    RUN_TEST(test_gleicher_wert_setzt_nichts_zurueck);
+    RUN_TEST(test_zwangsobjekte_gleichrangig_letztes_gewinnt);
+    RUN_TEST(test_zwangsobjekte_hierarchisch);
+    RUN_TEST(test_zwangsobjekt_ohne_laufzeit_bleibt);
+    RUN_TEST(test_zwangsobjekt_belegung_parametrierbar);
+    RUN_TEST(test_handstufe_laeuft_ab);
+    RUN_TEST(test_handstufe_dauerhaft);
+    RUN_TEST(test_handbetrieb_per_null_beenden);
+    RUN_TEST(test_handbetrieb_ein_uebernimmt_die_laufende_stufe);
+    RUN_TEST(test_handbetrieb_ein_bei_laufendem_handbetrieb_aendert_nichts);
+    RUN_TEST(test_zwangsbetriebsart_laeuft_ab);
+    RUN_TEST(test_rueckmeldung_zustand_nach_ablauf);
+    RUN_TEST(test_rueckmeldung_zustand_nach_ruecksetzen);
+    RUN_TEST(test_laufzeit_ueber_den_millis_ueberlauf);
+    RUN_TEST(test_schritt_hoch_und_runter);
+    RUN_TEST(test_schritt_klemmt_an_den_enden);
+    RUN_TEST(test_stufen_werden_geklemmt);
+    RUN_TEST(test_reset);
+    RUN_TEST(test_vorgabe_ohne_ueberlagerung);
+    return UNITY_END();
+}

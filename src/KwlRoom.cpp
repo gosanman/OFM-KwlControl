@@ -1,0 +1,1134 @@
+#include "KwlRoom.h"
+
+#include "KwlRoomModule.h"
+#include "knxprod.h"
+
+#include <cmath>
+#include <cstring>
+
+namespace Kwl
+{
+    namespace
+    {
+        /// Laufzeiten stehen in der ETS in Minuten, 0 heisst unendlich.
+        uint32_t minutesToMs(uint8_t minutes)
+        {
+            return static_cast<uint32_t>(minutes) * 60000u;
+        }
+
+        /// Intermittierende Abluft: Aktivzeit und Periode in Minuten, Index 0 = dauernd.
+        /// Reihenfolge wie im ETS-Enum PT-RoomExhaustInterval.
+        struct Intermittent
+        {
+            uint8_t activeMin;
+            uint8_t periodMin;
+        };
+        constexpr Intermittent kIntermittent[] = {
+            {0, 0}, // dauernd
+            {1, 5},
+            {2, 5},
+            {1, 15},
+            {2, 15},
+            {5, 15},
+            {1, 30},
+            {2, 30},
+            {5, 30},
+            {10, 30}};
+
+        /// Ist der Messwert vorhanden und nicht zu alt?
+        bool fresh(bool valid, uint32_t stamp, uint32_t now, uint32_t timeout)
+        {
+            if (!valid)
+                return false;
+            if (timeout == 0)
+                return true;
+            return (now - stamp) < timeout;
+        }
+    } // namespace
+
+    // Freigaben je Betriebsart. Die ETS-Makros sind eigene Namen je Betriebsart und
+    // lassen sich nicht indizieren; die Zuordnung Betriebsart -> ETS-Praefix steht
+    // deshalb genau hier und nirgends sonst.
+    KwlRoom::ModeFlags KwlRoom::readModeFlags(OperatingMode mode) const
+    {
+        ModeFlags f{};
+        switch (mode)
+        {
+#define KWL_MODE_FLAGS(enumName, prefix)            \
+    case OperatingMode::enumName:                   \
+        f.leadHum = ParamROOM_r##prefix##LeadHum;   \
+        f.leadCo2 = ParamROOM_r##prefix##LeadCO2;   \
+        f.leadVoc = ParamROOM_r##prefix##LeadVOC;   \
+        f.leadTemp = ParamROOM_r##prefix##LeadTemp; \
+        f.dehum = ParamROOM_r##prefix##Dehum;       \
+        f.frost = ParamROOM_r##prefix##Frost;       \
+        f.interval = ParamROOM_r##prefix##Interval; \
+        f.runOn = ParamROOM_r##prefix##RunOn;       \
+        f.cycleWish = ParamROOM_r##prefix##Cycle;   \
+        break;
+
+            KWL_MODE_FLAGS(Comfort, Comfort)
+            KWL_MODE_FLAGS(Standby, Standby)
+            KWL_MODE_FLAGS(Eco, Night)
+            KWL_MODE_FLAGS(Protection, Protect)
+            KWL_MODE_FLAGS(Boost, Boost)
+            KWL_MODE_FLAGS(Reduction, Lower)
+            KWL_MODE_FLAGS(Quiet, Quiet)
+#undef KWL_MODE_FLAGS
+        default:
+            break;
+        }
+        return f;
+    }
+
+    KwlRoom::KwlRoom(uint8_t index)
+    {
+        _channelIndex = index;
+    }
+
+    void KwlRoom::setup()
+    {
+        mActive = ParamROOM_rActive;
+        if (!mActive)
+            return;
+
+        // --- Parametersatz je Betriebsart (Rang 6) --------------------------
+        // Grundstufe laeuft immer, Maximalstufe deckelt die Fuehrungen. Die
+        // Reihenfolge folgt OperatingMode, nicht der ETS-Seitenreihenfolge.
+        // Die Param-Makros liefern int. In der geschweiften Klammer waere das
+        // eine verengende Umwandlung - im Standard sogar ein Fehler, den GCC nur
+        // als Warnung fuehrt. Deshalb ausdruecklich casten.
+        auto params = [](int base, int max) {
+            return ModeParams{static_cast<uint8_t>(base), static_cast<uint8_t>(max)};
+        };
+
+        mArbiter.setModeParams(OperatingMode::Comfort,
+                               params(ParamROOM_rComfortBase, ParamROOM_rComfortMax));
+        mArbiter.setModeParams(OperatingMode::Standby,
+                               params(ParamROOM_rStandbyBase, ParamROOM_rStandbyMax));
+        mArbiter.setModeParams(OperatingMode::Eco,
+                               params(ParamROOM_rNightBase, ParamROOM_rNightMax));
+        mArbiter.setModeParams(OperatingMode::Protection,
+                               params(ParamROOM_rProtectBase, ParamROOM_rProtectMax));
+        mArbiter.setModeParams(OperatingMode::Boost,
+                               params(ParamROOM_rBoostBase, ParamROOM_rBoostMax));
+        mArbiter.setModeParams(OperatingMode::Reduction,
+                               params(ParamROOM_rLowerBase, ParamROOM_rLowerMax));
+        mArbiter.setModeParams(OperatingMode::Quiet,
+                               params(ParamROOM_rQuietBase, ParamROOM_rQuietMax));
+
+        mArbiter.setStandardMode(static_cast<OperatingMode>(ParamROOM_rDefaultMode));
+
+        // --- Ueberlagerungen (Raenge 5 und 7…9) -----------------------------
+        mArbiter.setManualRuntime(minutesToMs(ParamROOM_rManualTimeout));
+
+        // Polaritaet der Bedienobjekte. Wert 0 ist das Standardverhalten;
+        // 1 dreht das jeweilige Objekt fuer Bedienfelder um.
+        mStatusTextOn = ParamROOM_rStatusText;
+        mManualInverted = ParamROOM_rManualPolarity;
+        mSummerInverted = ParamROOM_rSummerPolarity;
+        mForceOnZero = ParamROOM_rForcePolarity;
+
+        // Rueckmeldung. Der Ausgangszustand - kein Zwang, keine
+        // Nacht - steht lesbar im Objekt, gesendet wird er nicht: auf einer
+        // zentralen Adresse wuerde ein Neustart sonst das ganze Haus umschalten.
+        mForceFeedback = ParamROOM_rForceFeedback;
+        mNightFeedback = ParamROOM_rNightFeedback;
+        if (mForceFeedback)
+        {
+            KoROOM_Force1.valueNoSend(mForceOnZero, DPT_Switch);
+            KoROOM_Force2.valueNoSend(mForceOnZero, DPT_Switch);
+            KoROOM_Force3.valueNoSend(mForceOnZero, DPT_Switch);
+        }
+        if (mNightFeedback)
+        {
+            KoROOM_Night.valueNoSend(false, DPT_Switch);
+            KoROOM_ForcedMode.valueNoSend(static_cast<uint8_t>(0), DPT_Value_1_Ucount);
+        }
+        mArbiter.setForcedModeRuntime(minutesToMs(ParamROOM_rForcedMode));
+        mArbiter.setForcedObjectHierarchical(ParamROOM_rForcePrio);
+        mArbiter.setForcedObject(1, static_cast<OperatingMode>(ParamROOM_rForce1Mode),
+                                 minutesToMs(ParamROOM_rForce1Time));
+        mArbiter.setForcedObject(2, static_cast<OperatingMode>(ParamROOM_rForce2Mode),
+                                 minutesToMs(ParamROOM_rForce2Time));
+        mArbiter.setForcedObject(3, static_cast<OperatingMode>(ParamROOM_rForce3Mode),
+                                 minutesToMs(ParamROOM_rForce3Time));
+
+        // Das Nacht-Objekt traegt nicht zwingend "Eco": es kann auch auf
+        // Temperatur-Absenkung oder Ruhe gelegt werden.
+        mArbiter.setNightMode(static_cast<OperatingMode>(ParamROOM_rNightMode));
+
+        // --- Schutz (Rang 2) und Sperre (Rang 1) ----------------------------
+        // Sperrverhalten: 0 = Stillstand, 1 = Grundstufe der Betriebsart. Beides
+        // entscheidet der Arbiter selbst (StageArbiter::setLock(active, keepBase)),
+        // damit Rang 1 eine einzige Stelle bleibt - loop() bessert daran nichts
+        // nach. Im Verbund setzt KwlFanModule::driveGroup() die Stufe dieses Raums
+        // je Luefter ein (fanStageInGroup), auch die Grundstufe.
+        mLockKeepsBase = ParamROOM_rLockBehaviour;
+
+        mTemp.setFrostLimit(static_cast<float>(ParamROOM_rFrostTemp));
+        mTemp.setHeatLimit(static_cast<float>(ParamROOM_rHeatTemp));
+        mTemp.setDistance(static_cast<float>(ParamROOM_rTempGap));
+        mTemp.setStages(ParamROOM_rCoolStage, ParamROOM_rHeatStage);
+
+        // --- Fuehrungen (Rang 6) --------------------------------------------
+        const float humidity[kStageMax + 1] = {
+            static_cast<float>(ParamROOM_rHumGW0), static_cast<float>(ParamROOM_rHumGW1),
+            static_cast<float>(ParamROOM_rHumGW2), static_cast<float>(ParamROOM_rHumGW3),
+            static_cast<float>(ParamROOM_rHumGW4)};
+        mHumidity.setThresholds(humidity);
+
+        const float co2[kStageMax + 1] = {
+            static_cast<float>(ParamROOM_rCO2GW0), static_cast<float>(ParamROOM_rCO2GW1),
+            static_cast<float>(ParamROOM_rCO2GW2), static_cast<float>(ParamROOM_rCO2GW3),
+            static_cast<float>(ParamROOM_rCO2GW4)};
+        mCo2.setThresholds(co2);
+
+        const float voc[kStageMax + 1] = {
+            static_cast<float>(ParamROOM_rVOCGW0), static_cast<float>(ParamROOM_rVOCGW1),
+            static_cast<float>(ParamROOM_rVOCGW2), static_cast<float>(ParamROOM_rVOCGW3),
+            static_cast<float>(ParamROOM_rVOCGW4)};
+        mVoc.setThresholds(voc);
+
+        mCompare.setThresholds(static_cast<float>(ParamROOM_rDehumOn) / 10.0f,
+                               static_cast<float>(ParamROOM_rDehumOff) / 10.0f);
+
+        // --- Sensorik --------------------------------------------------------
+        mSensorTimeout = static_cast<uint32_t>(ParamROOM_rSensorTimeout) * 60000u;
+        mStopOnMissing = ParamROOM_rOnMissing;
+        mVocUnit = ParamROOM_rVOCUnit;
+
+        // Raum 1 ist die Quelle, kann sie also nicht selbst uebernehmen. Die ETS
+        // blendet die Parameter dort aus; die Pruefung hier ist der Gurt dazu.
+        mOutdoorFromRoom1 = _channelIndex > 0 && ParamROOM_rOutdoorSource;
+        mModeFromRoom1 = _channelIndex > 0 && ParamROOM_rModeSource;
+        mAltitude = static_cast<float>(ParamROOM_Altitude);
+
+        // --- Abluftanforderung ----------------------------------------------
+        mExhaustStage = ParamROOM_rExhaustStage;
+        mExhaustLeadMs = static_cast<uint32_t>(ParamROOM_rExhaustLead) * 1000u;
+        mExhaustLagMs = minutesToMs(ParamROOM_rExhaustLag);
+        mExhaustIntervalIdx = ParamROOM_rExhaustInterval;
+        mSendSupplyReq = ParamROOM_rExhaustSupply;
+        mDehumStage = ParamROOM_rDehumStage;
+
+        // --- Intervallbetrieb ------------------------------------------------
+        mIntervalPeriodMs = static_cast<uint32_t>(ParamROOM_rIntervalPeriod) * 60000u;
+        mIntervalActiveMs = static_cast<uint32_t>(ParamROOM_rIntervalActive) * 60000u;
+
+        logDebugP("Raum bereit, Standard-Betriebsart %u, Sensorzeit %u min",
+                  (unsigned)ParamROOM_rDefaultMode, (unsigned)ParamROOM_rSensorTimeout);
+    }
+
+    // ------------------------------------------------------------ Eingaenge
+
+    void KwlRoom::readSensor(Sensor& s, GroupObject& ko, const Dpt& dpt, uint32_t now)
+    {
+        KNXValue v(0.0f);
+        if (ko.tryValue(v, dpt))
+            s.set(static_cast<float>(v), now);
+        else
+            s.valid = false;
+    }
+
+    void KwlRoom::processInputKo(GroupObject &ko)
+    {
+        if (!mActive)
+            return;
+
+        const int index = ROOM_KoCalcIndex(ko.asap());
+        const uint32_t now = millis();
+
+        switch (index)
+        {
+        // --- Rang 1: Sperre ---------------------------------------------
+        case ROOM_KoLock:
+            mLocked = ko.value(DPT_Switch);
+            mArbiter.setLock(mLocked, mLockKeepsBase);
+            break;
+
+        // --- Rang 5: Handstufe ------------------------------------------
+        case ROOM_KoStageSet:
+            // DPT 5.100 Luefterstufe, nicht 5.010.
+            mArbiter.setManualStage(ko.value(DPT_Value_1_Ucount), now);
+            break;
+
+        case ROOM_KoStageSetPct:
+            // Prozent ist Eingabeformat, Stufe ist Wahrheit: die Uebersetzung
+            // findet hier am Rand statt und geht nicht weiter nach innen.
+            mArbiter.setManualStage(mPercent.update(ko.value(DPT_Scaling)), now);
+            break;
+
+        case ROOM_KoStageStep:
+            mArbiter.stepManual(ko.value(DPT_Step) ? +1 : -1, now);
+            break;
+
+        case ROOM_KoManualAct:
+            // Ein- und Ausgang: eine 0 vom Bus beendet den Handbetrieb sofort,
+            // eine 1 friert die laufende Stufe als Handstufe ein. Bei "1 =
+            // Automatik" genau umgekehrt.
+            mArbiter.setManualActive(static_cast<bool>(ko.value(DPT_Switch)) != mManualInverted, now);
+            break;
+
+        // --- Raenge 7…10: Betriebsart -----------------------------------
+        // Betriebsart als rohes Byte lesen, NICHT mit DPT_HVACMode: die
+        // KNX-Bibliothek kennt die Hauptgruppe 20 nicht, die Dekodierung
+        // scheitert und liefert 0 = Auto - jede Betriebsart ueber KNX setzte den
+        // Raum dann auf die Standard-Betriebsart. Am Bus ist 20.102 ein Byte;
+        // 1...4 nach Norm, 5...7 der "erweiterte HVAC-Modus".
+        case ROOM_KoMode:
+        {
+            const uint8_t mode = ko.value(DPT_Value_1_Ucount);
+            if (mode > kModeCount)
+            {
+                logErrorP("Betriebsart %u ungueltig - ignoriert", (unsigned)mode);
+                break;
+            }
+            mArbiter.setMode(static_cast<OperatingMode>(mode), now);
+            break;
+        }
+
+        case ROOM_KoForcedMode:
+        {
+            const uint8_t mode = ko.value(DPT_Value_1_Ucount);
+            if (mode > kModeCount)
+            {
+                logErrorP("Zwangsbetriebsart %u ungueltig - ignoriert", (unsigned)mode);
+                break;
+            }
+            if (mode == 0)
+                mArbiter.clearForcedMode(now);
+            else
+                mArbiter.setForcedMode(static_cast<OperatingMode>(mode), now);
+            mKoForcedMode = mArbiter.forcedModeValue();
+            break;
+        }
+
+        case ROOM_KoNight:
+            mArbiter.setNight(ko.value(DPT_Switch), now);
+            mKoNight = mArbiter.nightActive();
+            break;
+
+        // "Zwangsobjekte wirken bei 0": fuer ein Ein/Aus am Bedienfeld, dessen
+        // Aus (0) eine Betriebsart wie Ruhe erzwingen soll. Vor dem ersten
+        // Telegramm ist kein Zwang aktiv, auch in dieser Einstellung.
+        case ROOM_KoForce1:
+            mArbiter.setForcedObjectState(1, static_cast<bool>(ko.value(DPT_Switch)) != mForceOnZero, now);
+            mKoForce[1] = mArbiter.forcedObjectActive(1);
+            break;
+        case ROOM_KoForce2:
+            mArbiter.setForcedObjectState(2, static_cast<bool>(ko.value(DPT_Switch)) != mForceOnZero, now);
+            mKoForce[2] = mArbiter.forcedObjectActive(2);
+            break;
+        case ROOM_KoForce3:
+            mArbiter.setForcedObjectState(3, static_cast<bool>(ko.value(DPT_Switch)) != mForceOnZero, now);
+            mKoForce[3] = mArbiter.forcedObjectActive(3);
+            break;
+
+        // --- Rang 6: Messwerte -------------------------------------------
+        case ROOM_KoHumIn:
+            readSensor(mHumIn, ko, DPT_Value_Humidity, now);
+            break;
+        case ROOM_KoTempIn:
+            readSensor(mTempIn, ko, DPT_Value_Temp, now);
+            break;
+        case ROOM_KoHumOut:
+            readSensor(mHumOut, ko, DPT_Value_Humidity, now);
+            break;
+        case ROOM_KoTempOut:
+            readSensor(mTempOut, ko, DPT_Value_Temp, now);
+            break;
+        case ROOM_KoTempSet:
+            readSensor(mTempSet, ko, DPT_Value_Temp, now);
+            break;
+        case ROOM_KoCO2:
+            readSensor(mCo2Val, ko, DPT_Value_AirQuality, now);
+            break;
+
+        case ROOM_KoVOC:
+            // Das 2-Byte-Objekt traegt zwei Formate (Room.templ.xml: Ref 01 = 9.008,
+            // Ref 02 = 7.001). Format 2 gehoert hierher, nicht ans Byte-Objekt,
+            // das nie einen 16-Bit-Wert tragen kann.
+            if (mVocUnit == 0)
+                readSensor(mVocVal, ko, DPT_Value_AirQuality, now);
+            else if (mVocUnit == 2)
+                readSensor(mVocVal, ko, DPT_Value_2_Ucount, now);
+            break;
+        case ROOM_KoVOCByte:
+            // 1-Byte-Objekt, nur fuer Index 0..255 (5.010).
+            if (mVocUnit == 1)
+                mVocVal.set(ko.value(DPT_Value_1_Ucount), now);
+            break;
+
+        // --- Freigaben der Fuehrungen ---------------------------------------
+        case ROOM_KoHumLead:
+            mLeadHumKo = ko.value(DPT_Switch);
+            break;
+        case ROOM_KoCO2Lead:
+            mLeadCo2Ko = ko.value(DPT_Switch);
+            break;
+        case ROOM_KoVOCLead:
+            mLeadVocKo = ko.value(DPT_Switch);
+            break;
+        case ROOM_KoTempLead:
+            // Nur als Eingang: als Ausgang meldet dasselbe KO die freie
+            // Kuehlung an die Heizungsregelung (Parameter rTempLeadMode).
+            if (!ParamROOM_rTempLeadMode)
+                mLeadTempKo = ko.value(DPT_Switch);
+            break;
+
+        case ROOM_KoSummer:
+            // Bei "1 = Waermerueckgewinnung" heisst eine 0 Sommer.
+            mSummer = static_cast<bool>(ko.value(DPT_Switch)) != mSummerInverted;
+            break;
+
+        // --- Rang 3: Betriebsweise und Abluftanforderung ------------------
+        case ROOM_KoDirMode:
+        {
+            // 0 = auto, 1 = WRG, 2 = Zuluft, 3 = Abluft. Alles andere wird
+            // verworfen und erzwingt nicht etwa die Abluft.
+            const uint8_t dir = ko.value(DPT_Value_1_Ucount);
+            if (dir > 3)
+            {
+                logErrorP("Betriebsweise %u ungueltig - ignoriert", (unsigned)dir);
+                break;
+            }
+            mDirMode = dir;
+            break;
+        }
+
+        case ROOM_KoExhaustReq:
+            mExhaustReq = ko.value(DPT_Switch);
+            break;
+
+        default:
+            // Betriebsweise-KO, Abluftanforderung und Intervallbetrieb folgen
+            // im naechsten Schritt.
+            break;
+        }
+    }
+
+    // ------------------------------------------------------------ Geraet
+
+    void KwlRoom::forceModeFromDevice(OperatingMode mode, uint32_t now)
+    {
+        if (mActive)
+            mArbiter.setForcedMode(mode, now);
+    }
+
+    void KwlRoom::clearForcedModeFromDevice(uint32_t now)
+    {
+        if (mActive)
+            mArbiter.clearForcedMode(now);
+    }
+
+    bool KwlRoom::forcedModeActive(OperatingMode mode) const
+    {
+        // Rang 9 ist die Zwangsbetriebsart. Steht dort gerade diese Betriebsart,
+        // ist "die Taste" der Grund - oder ein KO, das dasselbe gesagt hat; fuer
+        // das Umschalten ist das gleichwertig.
+        return mActive && mStage.modeRank == 9 && mStage.mode == mode;
+    }
+
+    // ------------------------------------------------------------ Ablauf
+
+    void KwlRoom::expireSensors(uint32_t now)
+    {
+        Sensor *all[] = {&mHumIn, &mTempIn, &mHumOut, &mTempOut, &mCo2Val, &mVocVal,
+                         &mTempSet};
+        for (Sensor *s : all)
+            if (s->valid && !fresh(true, s->stamp, now, mSensorTimeout))
+                s->valid = false;
+    }
+
+    bool KwlRoom::intervalActive(uint32_t now) const
+    {
+        if (mIntervalPeriodMs == 0 || mIntervalActiveMs >= mIntervalPeriodMs)
+            return true; // entartete Parametrierung: dauernd lueften
+        return (now % mIntervalPeriodMs) < mIntervalActiveMs;
+    }
+
+    uint8_t KwlRoom::applyRunOn(uint8_t guidance, uint8_t runOnMinutes, uint32_t now)
+    {
+        // Nachlauf nach Anforderungsende: faellt der Wunsch der Fuehrungen, bleibt
+        // er fuer die parametrierte Zeit stehen. Ein Bad soll nach dem Duschen
+        // nicht in dem Augenblick abschalten, in dem die Feuchte unter den
+        // Grenzwert rutscht - die Luft ist dann noch nicht draussen.
+        // Die Fuehrung, die den gehaltenen Wunsch geliefert hat, haelt mit - der
+        // Klartext-Status sagt im Nachlauf weiter "Feuchte", nicht "Komfort".
+        if (guidance >= mGuidanceHold)
+        {
+            mGuidanceHold = guidance;
+            mGuidanceHoldSince = now;
+            mLeadHold = mLeadNow;
+            return guidance;
+        }
+
+        const uint32_t runOn = minutesToMs(runOnMinutes);
+        if (runOn != 0 && (now - mGuidanceHoldSince) < runOn)
+            return mGuidanceHold;
+
+        mGuidanceHold = guidance;
+        mGuidanceHoldSince = now;
+        mLeadHold = mLeadNow;
+        return guidance;
+    }
+
+    void KwlRoom::runExhaust(const ModeFlags &flags, uint32_t now)
+    {
+        (void)flags;
+
+        switch (mExhaust)
+        {
+        case ExhaustState::Idle:
+            if (mExhaustReq)
+            {
+                mExhaust = mExhaustLeadMs > 0 ? ExhaustState::Lead
+                                              : ExhaustState::Active;
+                mExhaustSince = now;
+            }
+            break;
+
+        case ExhaustState::Lead:
+            // Wird die Anforderung im Vorlauf zurueckgenommen, ist nichts
+            // geschehen - kein Nachlauf fuer eine Lueftung, die nie lief.
+            if (!mExhaustReq)
+                mExhaust = ExhaustState::Idle;
+            else if ((now - mExhaustSince) >= mExhaustLeadMs)
+            {
+                mExhaust = ExhaustState::Active;
+                mExhaustSince = now;
+            }
+            break;
+
+        case ExhaustState::Active:
+            if (!mExhaustReq)
+            {
+                mExhaust = mExhaustLagMs > 0 ? ExhaustState::Lag
+                                             : ExhaustState::Idle;
+                mExhaustSince = now;
+            }
+            break;
+
+        case ExhaustState::Lag:
+            if (mExhaustReq)
+            {
+                mExhaust = ExhaustState::Active;
+                mExhaustSince = now;
+            }
+            else if ((now - mExhaustSince) >= mExhaustLagMs)
+                mExhaust = ExhaustState::Idle;
+            break;
+        }
+
+        bool running = (mExhaust == ExhaustState::Active || mExhaust == ExhaustState::Lag);
+
+        // Intermittierend: innerhalb der Anforderung wird nur die Aktivzeit je
+        // Periode gefoerdert. In der Pause faellt der Raum auf seine Automatik
+        // zurueck, statt bei Stufe 0 zu stehen - die Grundlueftung laeuft weiter.
+        if (running && mExhaustIntervalIdx > 0 &&
+            mExhaustIntervalIdx < (sizeof(kIntermittent) / sizeof(kIntermittent[0])))
+        {
+            const Intermittent &iv = kIntermittent[mExhaustIntervalIdx];
+            const uint32_t period = static_cast<uint32_t>(iv.periodMin) * 60000u;
+            const uint32_t active = static_cast<uint32_t>(iv.activeMin) * 60000u;
+            if (period > 0 && ((now - mExhaustSince) % period) >= active)
+                running = false;
+        }
+
+        mArbiter.setAirDemand(running, Direction::Exhaust, mExhaustStage);
+
+        // Zuluftanforderung an die Partner: solange dieser Knoten Abluft faehrt,
+        // muss anderswo nachstroemen, sonst pfeift es an den Fenstern.
+        mSupplyReq = running && mSendSupplyReq;
+        if (mSentSupplyReq.due(mSupplyReq, now, 0))
+        {
+            KoROOM_SupplyReq.value(mSupplyReq, DPT_Switch);
+            mSentSupplyReq.mark(mSupplyReq, now);
+        }
+    }
+
+    uint8_t KwlRoom::runGuidance(OperatingMode mode, uint32_t now)
+    {
+        const ModeFlags f = readModeFlags(mode);
+        uint8_t wish = 0;
+        Lead lead = Lead::None; // staerkste Fuehrung, fuer den Klartext-Status
+
+        // Aussenwerte von Raum 1 uebernehmen. Sie gelten fuer das ganze Haus;
+        // sie in jedem Raum einzeln zu verknuepfen waere doppelte Buslast.
+        if (mOutdoorFromRoom1)
+        {
+            KwlRoom* source = openknxKwlRoomModule.room(1);
+            if (source != nullptr && source->isActive() && source->hasOutdoor())
+            {
+                mHumOut.set(source->humidityOut(), now);
+                mTempOut.set(source->tempOut(), now);
+            }
+        }
+
+        // --- Feuchtevergleich ------------------------------------------------
+        // Er entscheidet, ob Lueften ueberhaupt trocknet. Ohne Aussenwerte bleibt
+        // er gesperrt: nicht gemessen heisst nicht entfeuchten.
+        const bool dehumInputs =
+            mHumIn.valid && mTempIn.valid && mHumOut.valid && mTempOut.valid;
+        bool dehumAllowed = false;
+        if (f.dehum && dehumInputs)
+        {
+            const float eIn = MoistAir::vapourPressure(mTempIn.value, mHumIn.value);
+            const float eOut = MoistAir::vapourPressure(mTempOut.value, mHumOut.value);
+            dehumAllowed = mCompare.update(eIn, eOut);
+        }
+        else
+        {
+            mCompare.reset();
+        }
+        // "Sperrt" heisst: gemessen, und draussen ist es feuchter. Fehlende
+        // Messwerte sind ein anderer Befund (Fehlercode 8, nicht 7).
+        mDehumBlocked = f.dehum && dehumInputs && !dehumAllowed;
+
+        // Fehlercode 7 nur, wenn die Sperre etwas unterdrueckt: Feuchtefuehrung
+        // an und die Raumfeuchte ueber der Einschaltgrenze von Stufe 1 (GW1),
+        // aus erst unter GW0 - dieselbe Hysterese wie die Treppe. Sonst stuende
+        // die 7 im Winter fast dauernd an, auch bei 30 % rF, und verdeckte die
+        // Codes 8-11. Objekt 31 meldet weiter den reinen Vergleich.
+        const bool humLeadOn = f.leadHum && mLeadHumKo && mHumIn.valid;
+        if (!mDehumBlocked || !humLeadOn)
+            mDehumBlockDemand = false;
+        else if (mHumIn.value >= mHumidity.threshold(1))
+            mDehumBlockDemand = true;
+        else if (mHumIn.value < mHumidity.threshold(0))
+            mDehumBlockDemand = false;
+
+        // --- Grenzwert-Treppen -----------------------------------------------
+        // Mit Feuchtevergleich laeuft die rF-Treppe nur, wenn Lueften auch
+        // trocknet - steht draussen feuchtere Luft, macht mehr Lueften den Raum
+        // feuchter. OHNE Feuchtevergleich (Bad ohne Aussensensor) laeuft sie
+        // frei: die beiden Funktionen sind in der ETS unabhaengig voneinander.
+        const bool humidityMayRun = f.dehum ? dehumAllowed : true;
+        if (f.leadHum && mLeadHumKo && mHumIn.valid && humidityMayRun)
+        {
+            const uint8_t s = mHumidity.update(mHumIn.value);
+            if (s > wish)
+            {
+                wish = s;
+                lead = Lead::Humidity;
+            }
+
+            // Stufe bei Entfeuchtung: solange die Entfeuchtung wirkt UND es etwas
+            // zu trocknen gibt (Treppe ueber 0), mindestens diese Stufe. Ohne die
+            // zweite Bedingung liefe jeder Raum den ganzen Winter auf ihr - im
+            // Winter ist Lueften praktisch immer "trocknend".
+            if (dehumAllowed && s > 0 && mDehumStage > wish)
+            {
+                wish = mDehumStage;
+                lead = Lead::Humidity;
+            }
+        }
+        else
+        {
+            mHumidity.reset();
+        }
+
+        if (f.leadCo2 && mLeadCo2Ko && mCo2Val.valid)
+        {
+            const uint8_t s = mCo2.update(mCo2Val.value);
+            if (s > wish)
+            {
+                wish = s;
+                lead = Lead::Co2;
+            }
+        }
+        else
+        {
+            mCo2.reset();
+        }
+
+        if (f.leadVoc && mLeadVocKo && mVocVal.valid)
+        {
+            const uint8_t s = mVoc.update(mVocVal.value);
+            if (s > wish)
+            {
+                wish = s;
+                lead = Lead::Voc;
+            }
+        }
+        else
+        {
+            mVoc.reset();
+        }
+
+        // --- Temperaturfuehrung und Schutz ------------------------------------
+        uint8_t cycleWish = f.cycleWish;
+        const bool tempComplete = mTempIn.valid && mTempOut.valid && mTempSet.valid;
+        if (tempComplete)
+        {
+            const TempResult t =
+                mTemp.update(mTempIn.value, mTempOut.value, mTempSet.value);
+            if (f.leadTemp && mLeadTempKo)
+            {
+                if (t.stageRequest > wish)
+                {
+                    wish = t.stageRequest;
+                    lead = t.mode == TempMode::FreeCooling ? Lead::Cooling : Lead::WarmAir;
+                }
+                // Die Temperaturfuehrung darf den Takt vorgeben, aber nur wenn die
+                // Betriebsart ihn nicht fest vorschreibt.
+                if (t.cycle != CycleRule::FromOperatingMode && cycleWish <= 2)
+                    cycleWish = static_cast<uint8_t>(t.cycle);
+            }
+        }
+        else
+        {
+            // Ohne Sollwert keine Fuehrung - aber der Schutz braucht nur die
+            // Innentemperatur. Ein Raum bei 5 Grad darf nicht weiterlueften,
+            // bloss weil der Thermostat schweigt.
+            mTemp.updateProtection(mTempIn.valid ? mTempIn.value : NAN,
+                                   mTempOut.valid ? mTempOut.value : NAN);
+        }
+
+        // Frostschutz gilt nur, wenn die Betriebsart ihn zulaesst - im
+        // Gebaeudeschutz immer. Der Hitzeschutz gilt unabhaengig davon.
+        const TempResult t = mTemp.result();
+        mFrostActive = t.frostProtection && (f.frost || mode == OperatingMode::Protection);
+        mProtection = mFrostActive || t.heatProtection;
+
+        // "Bei fehlenden Messwerten" meint Messwerte, die eine EINGESCHALTETE
+        // Fuehrung braucht - nicht jeden Sensor, der zufaellig nicht verknuepft
+        // ist. Einem Raum ohne Fuehrungen fehlt nichts.
+        mSensorsMissing = (f.leadHum && mLeadHumKo && !mHumIn.valid) ||
+                          (f.leadCo2 && mLeadCo2Ko && !mCo2Val.valid) ||
+                          (f.leadVoc && mLeadVocKo && !mVocVal.valid) ||
+                          (f.leadTemp && mLeadTempKo && !tempComplete) ||
+                          (f.dehum && !dehumInputs);
+
+        applyCycleWish(cycleWish);
+        mLeadNow = lead;
+        return wish;
+    }
+
+    void KwlRoom::applyCycleWish(uint8_t wish)
+    {
+        // ETS: 0 = ueber das Objekt "Sommer", 1 = WRG, 2 = Sommer,
+        //      3 = feste Richtung Zuluft, 4 = feste Richtung Abluft.
+        switch (wish)
+        {
+        case 1:
+            mCycleWish = CycleRule::Wrg;
+            break;
+        case 2:
+            mCycleWish = CycleRule::Summer;
+            break;
+        case 3:
+        case 4:
+            // Feste Richtung ist kein Takt, sondern eine Richtungsvorgabe an den
+            // Arbiter (Rang 3). Der Takt bleibt WRG, damit die Zykluszeit
+            // definiert ist. 3 = Zuluft, 4 = Abluft; das Betriebsweise-KO zaehlt
+            // 2 = Zuluft, 3 = Abluft - daher die Umrechnung.
+            mCycleWish = CycleRule::Wrg;
+            mModeDirection = (wish == 3) ? 2 : 3;
+            return;
+        case 0:
+        default:
+            mCycleWish = mSummer ? CycleRule::Summer : CycleRule::Wrg;
+            break;
+        }
+        mModeDirection = 0;
+    }
+
+    void KwlRoom::loop()
+    {
+        if (!mActive)
+            return;
+
+        const uint32_t ms = millis();
+        expireSensors(ms);
+
+        const StageResult before = mArbiter.result();
+
+        // Erst die Betriebsart feststellen - die Freigaben der Fuehrungen haengen
+        // an ihr. Dann rechnen, dann noch einmal bewerten, damit das Ergebnis
+        // nicht einen Durchlauf hinterherhinkt.
+        // Betriebsart von Raum 1 uebernehmen: die VORGABE aus dessen Objekt
+        // "Betriebsart" (Rang 10), behandelt wie ein hier empfangenes Telegramm,
+        // damit die Ruecksetz-Semantik gilt - eine Aenderung dort loescht hier
+        // Hand- und Zwangsobjekte. NICHT die WIRKSAME Betriebsart von Raum 1
+        // mit dessen Nacht und Zwangsobjekten obendrauf: ein Stosslueften in
+        // Raum 1 loeschte hier sonst die Nacht, und mit Rueckmeldung sendete
+        // dieser Raum dafuer Nacht = 0 auf den Bus - auf einer zentralen Adresse
+        // fuer das ganze Haus. Nacht, Zwangsobjekte und Zwangsbetriebsart
+        // bleiben Sache jedes Raums.
+        if (mModeFromRoom1)
+        {
+            KwlRoom* source = openknxKwlRoomModule.room(1);
+            if (source != nullptr && source->isActive())
+                mArbiter.setMode(source->modeSetpoint(), ms);
+        }
+
+        const OperatingMode mode = mArbiter.update(ms).mode;
+        const ModeFlags flags = readModeFlags(mode);
+        uint8_t guidance = runGuidance(mode, ms);
+
+        // Fehlen ALLE Fuehrungsgroessen, gilt der Parameter "bei fehlenden
+        // Messwerten". Faellt nur eine aus, rechnen die uebrigen weiter - dafuer
+        // sind es mehrere.
+        // mSensorsMissing hat runGuidance() gesetzt: eine eingeschaltete Fuehrung
+        // hat ihren Messwert nicht. Die uebrigen rechnen weiter - der Wunsch wird
+        // NICHT verworfen, sonst verloere ein Raum mit Temperaturfuehrung seine
+        // Kuehlung, bloss weil kein CO2-Sensor verknuepft ist.
+        guidance = applyRunOn(guidance, flags.runOn, ms);
+
+        // Rang 6 stilllegen - Grundstufe eingeschlossen. Zwei Gruende fuehren
+        // dorthin: die Intervallpause und "bei fehlenden Messwerten: Stillstand".
+        //
+        // Den Fuehrungswunsch auf 0 zu setzen reicht dafuer NICHT: Rang 6 rechnet
+        // max(Grundstufe, Fuehrung), und die Grundstufe liefe weiter. Der
+        // Parameter haette in seiner Stellung "Stillstand" nichts getan.
+        mIntervalRunning = !flags.interval || intervalActive(ms);
+        const bool stopForMissing = mSensorsMissing && mStopOnMissing;
+        mArbiter.setAutomaticSuppressed(!mIntervalRunning || stopForMissing);
+
+        // Betriebsweise-KO: 2 und 3 erzwingen eine Richtung, 1 bleibt beim Takt.
+        // Das Betriebsweise-KO (Bedienung) geht vor der Zyklusregel der
+        // Betriebsart (Parameter). Beide zaehlen 2 = Zuluft, 3 = Abluft.
+        const uint8_t direction = (mDirMode >= 2) ? mDirMode : mModeDirection;
+        mArbiter.setDirectionOverride(direction >= 2,
+                                      direction == 2 ? Direction::Supply
+                                                     : Direction::Exhaust);
+        if (mDirMode == 1)
+            mCycleWish = CycleRule::Wrg;
+
+        runExhaust(flags, ms);
+
+        mArbiter.setGuidanceStage(guidance);
+        mArbiter.setProtection(mProtection);
+
+        // Das Sperrverhalten liegt im Arbiter (setLock mit keepBase) - hier wird
+        // nichts nachgebessert. Rang 1 ist eine Stelle (Invariante 9).
+        mStage = mArbiter.update(ms);
+
+        (void)before;
+        sendStage();
+        sendMode();
+        sendModeExt();
+        sendHumidity();
+        sendOverlayFeedback();
+
+        if (mSentProtect.due(mProtection, ms, 0))
+        {
+            KoROOM_ProtectAct.value(mProtection, DPT_Switch);
+            mSentProtect.mark(mProtection, ms);
+        }
+        if (mSentDehumBlock.due(mDehumBlocked, ms, 0))
+        {
+            KoROOM_DehumBlock.value(mDehumBlocked, DPT_Switch);
+            mSentDehumBlock.mark(mDehumBlocked, ms);
+        }
+        if (mSentInterval.due(mIntervalRunning, ms, 0))
+        {
+            KoROOM_IntervalAct.value(mIntervalRunning, DPT_Switch);
+            mSentInterval.mark(mIntervalRunning, ms);
+        }
+        if (mSentDirMode.due(mDirMode, ms, 0))
+        {
+            KoROOM_DirModeAct.value(mDirMode, DPT_Value_1_Ucount);
+            mSentDirMode.mark(mDirMode, ms);
+        }
+
+        // Klartext-Status: nur bei Freischaltung, nur bei Aenderung.
+        if (mStatusTextOn)
+        {
+            StatusInput in;
+            in.stage = mStage.stage;
+            in.source = mStage.source;
+            in.mode = mStage.mode;
+            in.exhaust = mStage.direction == Direction::Exhaust;
+            in.frost = mFrostActive;
+            in.lead = mLeadHold;
+            in.baseStage = mArbiter.modeParams(mStage.mode).baseStage;
+            char text[kStatusTextSize];
+            statusText(in, text);
+            if (strcmp(text, mSentStatusText) != 0)
+            {
+                KoROOM_StatusText.value(text, DPT_String_8859_1);
+                strcpy(mSentStatusText, text);
+            }
+        }
+
+        // KO "Handbetrieb aktiv" ist laut ETS Ein- UND Ausgang und wird deshalb
+        // auch gesendet: sonst erfuehre ein Bedienfeld weder vom Ende der
+        // Handzeit noch vom Ruecksetzen durch eine Betriebsart.
+        const bool manualKo = mArbiter.manualActive() != mManualInverted;
+        if (mSentManualAct.due(manualKo, ms, 0))
+        {
+            KoROOM_ManualAct.value(manualKo, DPT_Switch);
+            mSentManualAct.mark(manualKo, ms);
+        }
+    }
+
+    void KwlRoom::sendOverlayFeedback()
+    {
+        // Zwangsobjekte, Nacht und Zwangsbetriebsart sind Ein- und Ausgang wie
+        // KO "Handbetrieb aktiv": Endet eine Laufzeit oder setzt eine andere
+        // Ebene sie zurueck, meldet das Objekt den neuen Zustand. Ein
+        // empfangener Wert steht schon im Merker und wird nicht zurueckgeschickt.
+        // Eigene Telegramme reicht der Stack nicht an processInputKo weiter (nur
+        // als Bestaetigung). Kaeme der Wert ueber eine geteilte Adresse von einem
+        // anderen Geraet zurueck, aendert er nichts mehr: Arbiter und Merker
+        // haben diesen Zustand bereits.
+        for (uint8_t i = 1; i <= 3; i++)
+        {
+            const bool active = mArbiter.forcedObjectActive(i);
+            if (active == mKoForce[i])
+                continue;
+            mKoForce[i] = active;
+            if (!mForceFeedback)
+                continue;
+            GroupObject &ko = (i == 1) ? KoROOM_Force1 : (i == 2) ? KoROOM_Force2 : KoROOM_Force3;
+            ko.value(active != mForceOnZero, DPT_Switch);
+        }
+
+        const bool night = mArbiter.nightActive();
+        if (night != mKoNight)
+        {
+            mKoNight = night;
+            if (mNightFeedback)
+                KoROOM_Night.value(night, DPT_Switch);
+        }
+
+        const uint8_t forced = mArbiter.forcedModeValue();
+        if (forced != mKoForcedMode)
+        {
+            mKoForcedMode = forced;
+            if (mNightFeedback)
+                KoROOM_ForcedMode.value(forced, DPT_Value_1_Ucount);
+        }
+    }
+
+    void KwlRoom::sendHumidity()
+    {
+        // Anzeige in g/kg. Der Vergleich selbst laeuft ueber den Partialdruck und
+        // braucht die Hoehe nicht - nur diese beiden Objekte tun es.
+        //
+        // Totband 0,05 g/kg: darunter ist es das Rauschen der Feuchtesensoren, und
+        // ein Wert, der sich in der letzten Stelle bewegt, gehoert nicht auf den
+        // Bus. Gerechnet wird in 1/100 g/kg, damit das Totband ganzzahlig bleibt.
+        const uint32_t ms = millis();
+        constexpr uint32_t kBand = 5;
+
+        if (mHumIn.valid && mTempIn.valid)
+        {
+            const float g = MoistAir::mixingRatioAt(mTempIn.value, mHumIn.value, mAltitude);
+            const int32_t raw = static_cast<int32_t>(g * 100.0f);
+            if (!mSentAbsIn.valid ||
+                SendCondition::passesDeadband(raw, mSentAbsIn.value, 0, kBand))
+            {
+                KoROOM_AbsHumIn.value(g, Dpt(9, 29));
+                mSentAbsIn.mark(raw, ms);
+            }
+        }
+
+        if (mHumOut.valid && mTempOut.valid)
+        {
+            const float g = MoistAir::mixingRatioAt(mTempOut.value, mHumOut.value, mAltitude);
+            const int32_t raw = static_cast<int32_t>(g * 100.0f);
+            if (!mSentAbsOut.valid ||
+                SendCondition::passesDeadband(raw, mSentAbsOut.value, 0, kBand))
+            {
+                KoROOM_AbsHumOut.value(g, Dpt(9, 29));
+                mSentAbsOut.mark(raw, ms);
+            }
+        }
+    }
+
+    ErrorCode KwlRoom::errorCode() const
+    {
+        // Die Reihenfolge der Codes IST die Prioritaet, der kleinste gewinnt.
+        // Keiner der drei ist ein Alarm: die Anlage laeuft weiter, sie tut nur
+        // nicht, was ohne die Einschraenkung gelte.
+        ErrorCode e = ErrorCode::None;
+        e = lowestError(e, mDehumBlockDemand ? ErrorCode::HumidityBlocks : ErrorCode::None);
+        e = lowestError(e, mSensorsMissing ? ErrorCode::SensorsMissing : ErrorCode::None);
+        e = lowestError(e, mProtection ? ErrorCode::ProtectionActive : ErrorCode::None);
+        return e;
+    }
+
+    void KwlRoom::sendStage()
+    {
+        const uint32_t ms = millis();
+        if (mSentStage.due(mStage.stage, ms, 0))
+        {
+            KoROOM_DemandStage.value(mStage.stage, DPT_Value_1_Ucount);
+            mSentStage.mark(mStage.stage, ms);
+        }
+
+        const uint8_t pct = StageMap::stageToPercent(mStage.stage);
+        if (mSentPct.due(pct, ms, 0))
+        {
+            KoROOM_DemandPct.value(pct, DPT_Scaling);
+            mSentPct.mark(pct, ms);
+        }
+    }
+
+    void KwlRoom::sendMode()
+    {
+        // Wie die Eingaenge als Byte: 1...4 nach 20.102, 5 Stossluefen,
+        // 6 Absenkung, 7 Ruhe ("erweiterter HVAC-Modus"). Mit DPT_HVACMode
+        // scheitert die Kodierung, und der Stack sendet gar nicht.
+        const uint32_t ms = millis();
+        const uint8_t mode = static_cast<uint8_t>(mStage.mode);
+        if (!mSentMode.due(mode, ms, 0))
+            return;
+        KoROOM_ModeAct.value(mode, DPT_Value_1_Ucount);
+        mSentMode.mark(mode, ms);
+    }
+
+    void KwlRoom::sendModeExt()
+    {
+        // HVAC-Status als Bitfeld (MDT-Schema, hvacStatusByte) fuer
+        // Visualisierungen, die den erweiterten HVAC-Modus nicht kennen. Die
+        // Betriebsart 1...7 sendet das Statusobjekt 27 selbst.
+        const uint32_t ms = millis();
+        const uint8_t status = hvacStatusByte(mStage.mode, mFrostActive);
+        if (!mSentModeExt.due(status, ms, 0))
+            return;
+        KoROOM_HvacStatus.value(status, DPT_Value_1_Ucount);
+        mSentModeExt.mark(status, ms);
+    }
+
+    // ------------------------------------------------------------ Konsole
+
+    void KwlRoom::printDiagnose(bool detail)
+    {
+#ifdef BASE_KoDiagnose
+        const unsigned no = _channelIndex + 1;
+        if (!mActive)
+        {
+            openknx.console.writeDiagnoseKo("R%u inaktiv", no);
+            return;
+        }
+
+        // "R8 S4 Rg6 M7" = 12: Stufe, Rang der Quelle, Betriebsart.
+        const StageResult& r = mStage;
+        openknx.console.writeDiagnoseKo("R%u S%u Rg%u M%u", no, (unsigned)r.stage,
+                                        (unsigned)static_cast<uint8_t>(r.source),
+                                        (unsigned)static_cast<uint8_t>(r.mode));
+        if (!detail)
+            return;
+
+        // Messwerte, "--" wenn keiner da ist - das ist beim Suchen die haeufigste
+        // Antwort. "rF100 C4000" = 11, "V5000 Ti-10" = 11.
+        char rf[6] = "--", co2[6] = "--", voc[6] = "--", ti[6] = "--";
+        if (mHumIn.valid)
+            snprintf(rf, sizeof(rf), "%d", (int)mHumIn.value);
+        if (mCo2Val.valid)
+            snprintf(co2, sizeof(co2), "%d", (int)mCo2Val.value);
+        if (mVocVal.valid)
+            snprintf(voc, sizeof(voc), "%d", (int)mVocVal.value);
+        if (mTempIn.valid)
+            snprintf(ti, sizeof(ti), "%d", (int)mTempIn.value);
+        openknx.console.writeDiagnoseKo("rF%s C%s", rf, co2);
+        openknx.console.writeDiagnoseKo("V%s Ti%s", voc, ti);
+
+        // Nur die Befunde, die anliegen - eine Zeile je Befund, keine Kuerzel.
+        if (mLocked)
+            openknx.console.writeDiagnoseKo("R%u Sperre", no);
+        if (mProtection)
+            openknx.console.writeDiagnoseKo("R%u Schutz", no);
+        if (mSensorsMissing)
+            openknx.console.writeDiagnoseKo("R%u Wert fehlt", no);
+        if (mDehumBlocked)
+            openknx.console.writeDiagnoseKo("R%u rF gesperrt", no);
+        if (!mIntervalRunning)
+            openknx.console.writeDiagnoseKo("R%u Pause", no);
+#else
+        (void)detail;
+#endif
+    }
+
+    void KwlRoom::printDetail()
+    {
+        const unsigned no = _channelIndex + 1;
+        if (!mActive)
+        {
+            logInfoP("Raum %u ist nicht aktiviert", no);
+            return;
+        }
+
+        static const char *kSource[] = {"-", "Sperre", "Schutz",
+                                        "Anforderung", "Verbund", "Handstufe",
+                                        "Automatik"};
+        static const char *kMode[] = {"Auto", "Komfort", "Standby", "Nacht",
+                                      "Schutz", "Stosslueften", "Absenkung",
+                                      "Ruhe"};
+
+        const StageResult &r = mStage;
+        const uint8_t src = static_cast<uint8_t>(r.source);
+        const uint8_t mode = static_cast<uint8_t>(r.mode);
+
+        logInfoP("Raum %u", no);
+        logIndentUp();
+        logInfoP("Stufe %u aus Rang %u (%s)", (unsigned)r.stage, (unsigned)src,
+                 src < 7 ? kSource[src] : "?");
+        logInfoP("Betriebsart %s von Ebene %u", mode < 8 ? kMode[mode] : "?",
+                 (unsigned)r.modeRank);
+        logInfoP("Grundstufe %u, Maximalstufe %u",
+                 (unsigned)mArbiter.modeParams(r.mode).baseStage,
+                 (unsigned)mArbiter.modeParams(r.mode).maxStage);
+
+        // Messwerte mit Gueltigkeit - "kein Wert" ist beim Suchen die haeufigste
+        // Antwort, deshalb steht sie ausdruecklich da und nicht als leeres Feld.
+        logInfoP("rF innen  %s", mHumIn.valid ? "gueltig" : "FEHLT");
+        if (mHumIn.valid)
+        {
+            logIndentUp();
+            logInfoP("%d,%u %%, Treppe auf Stufe %u", (int)mHumIn.value,
+                     (unsigned)((int)(mHumIn.value * 10) % 10),
+                     (unsigned)mHumidity.stage());
+            logIndentDown();
+        }
+        logInfoP("CO2 %s%s", mCo2Val.valid ? "gueltig" : "FEHLT",
+                 mCo2Val.valid ? "" : " (Fuehrung laeuft nicht)");
+        if (mCo2Val.valid)
+        {
+            logIndentUp();
+            logInfoP("%d ppm, Treppe auf Stufe %u", (int)mCo2Val.value,
+                     (unsigned)mCo2.stage());
+            logIndentDown();
+        }
+        logInfoP("VOC %s, Treppe auf Stufe %u", mVocVal.valid ? "gueltig" : "FEHLT",
+                 (unsigned)mVoc.stage());
+        logInfoP("T innen %s, T aussen %s, T soll %s",
+                 mTempIn.valid ? "gueltig" : "FEHLT",
+                 mTempOut.valid ? "gueltig" : "FEHLT",
+                 mTempSet.valid ? "gueltig" : "FEHLT");
+
+        logInfoP("Feuchtevergleich: %s", mDehumBlocked ? "SPERRT die rF-Treppe"
+                                                       : "erlaubt");
+        logInfoP("Schutz %s, Intervall %s, Sperre %s",
+                 mProtection ? "AKTIV" : "aus",
+                 mIntervalRunning ? "laeuft" : "PAUSE",
+                 mLocked ? "GESETZT" : "offen");
+
+        static const char *kExhaust[] = {"Ruhe", "Vorlauf", "Aktiv", "Nachlauf"};
+        logInfoP("Abluftanforderung: %s, Betriebsweise %u, Zykluswunsch %s",
+                 kExhaust[static_cast<uint8_t>(mExhaust)], (unsigned)mDirMode,
+                 mCycleWish == CycleRule::Summer ? "Sommer" : "WRG");
+        logIndentDown();
+    }
+
+    void KwlRoom::printStatusLine()
+    {
+        if (!mActive)
+        {
+            logInfoP("Raum %u: nicht aktiv", (unsigned)(_channelIndex + 1));
+            return;
+        }
+
+        const StageResult r = mArbiter.result();
+        logInfoP("Raum %u: Stufe %u aus Rang %u, Betriebsart %u von Ebene %u%s",
+                 (unsigned)(_channelIndex + 1), (unsigned)mStage.stage,
+                 (unsigned)static_cast<uint8_t>(r.source),
+                 (unsigned)static_cast<uint8_t>(r.mode), (unsigned)r.modeRank,
+                 mLocked ? ", gesperrt" : "");
+    }
+} // namespace Kwl
